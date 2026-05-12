@@ -49,7 +49,27 @@ function progressStatusLabel(value) {
 }
 
 function normalizeHeader(s) {
-  return String(s || '').replace(/[\s　・/／\\\-_（）()\[\]【】]/g, '').toLowerCase();
+  // NFKC で半角カナ→全角カナ・全角英数→半角英数を正規化
+  return String(s || '')
+    .normalize('NFKC')
+    .replace(/[\s　・/／\\\-_（）()\[\]【】]/g, '')
+    .toLowerCase();
+}
+
+// 複数の候補名を順に試して見つかったヘッダーインデックスを返す
+function findMatchingHeaderMulti(headers, candidates) {
+  for (var i = 0; i < candidates.length; i++) {
+    var idx = findMatchingHeader(headers, candidates[i]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+// 質問文中にフレーズが含まれるか（NFKC正規化して比較）
+function textContainsPhrase(text, phrase) {
+  var t = String(text || '').normalize('NFKC');
+  var p = String(phrase || '').normalize('NFKC');
+  return p && t.indexOf(p) !== -1;
 }
 
 // ヘッダー配列から keyword に最も近い列インデックスを返す（見つからなければ-1）
@@ -117,28 +137,69 @@ function analyzeProgressQuestion(text, headers) {
   // 全体モード
   if (/全部|全て|まとめて|一覧/.test(t)) analysis.mode = 'all';
 
-  // 対象列推定（フレーズ→列名候補のマップ）
+  // 対象列推定：フレーズ→候補ヘッダー（複数可）。最初に見つかったヘッダーを採用。
+  // 「発注」「納品」「見積」など複数列に対応する語は、複数列を同時に対象にする。
   var phraseMap = [
-    { phrases: ['図面チェック', '図面確認', '図面'],         header: '図面チェック' },
-    { phrases: ['依頼日', '依頼した日', '依頼の日', '依頼'], header: '依頼日' },
-    { phrases: ['発注'],                                       header: '発注' },
-    { phrases: ['見積もり', '見積り', '見積'],               header: '見積' },
-    { phrases: ['納品'],                                       header: '納品' },
-    { phrases: ['搬入'],                                       header: '搬入' },
-    { phrases: ['設置'],                                       header: '設置' },
-    { phrases: ['担当者', '担当'],                            header: '担当者' },
-    { phrases: ['区分', '美容', '理容'],                       header: '区分' },
+    { phrases: ['図面チェック', '図面確認', '図面'],
+      headers: ['図面チェック'], multi: false },
+    { phrases: ['依頼日', '依頼した日', '依頼の日', '依頼'],
+      headers: ['依頼日'], multi: false },
+    { phrases: ['制作一覧', '一覧入力', '一覧'],
+      headers: ['制作一覧入力'], multi: false },
+    { phrases: ['安陳見積もり', '安陳見積', '安陳の見積'],
+      headers: ['安陳見積もり', '安陳見積'], multi: false },
+    { phrases: ['安陳入力', '安陳'],
+      headers: ['安陳入力'], multi: false },
+    { phrases: ['スクショ見積', 'スクショ'],
+      headers: ['スクショ見積'], multi: false },
+    { phrases: ['金額調整', '金額確認', '金額'],
+      headers: ['金額調整確認'], multi: false },
+    { phrases: ['パイオニア見積', 'パイオニア', 'ﾊﾟｲｵﾆｱ'],
+      headers: ['ﾊﾟｲｵﾆｱ見積', 'パイオニア見積'], multi: false },
+    { phrases: ['発注書'],
+      headers: ['発注書'], multi: false },
+    { phrases: ['制作発注'],
+      headers: ['制作発注'], multi: false },
+    { phrases: ['発注'],
+      headers: ['制作発注', '発注書'], multi: true },
+    { phrases: ['納品日時', '納品日', '納品時間'],
+      headers: ['納品日時'], multi: false },
+    { phrases: ['納品場所'],
+      headers: ['納品場所'], multi: false },
+    { phrases: ['納品'],
+      headers: ['納品日時', '納品場所'], multi: true },
+    { phrases: ['完工日', '完工'],
+      headers: ['完工日'], multi: false },
+    { phrases: ['見積もり', '見積り', '見積'],
+      headers: ['見積'], multi: false },
+    { phrases: ['搬入'],
+      headers: ['搬入'], multi: false },
+    { phrases: ['設置'],
+      headers: ['設置'], multi: false },
+    { phrases: ['担当者', '担当'],
+      headers: ['担当者'], multi: false },
+    { phrases: ['区分', '美容', '理容', '理/美', '美/理'],
+      headers: ['区分', '理/美', '美/理'], multi: false },
   ];
+
+  var picked = {}; // 重複防止
   for (var pi = 0; pi < phraseMap.length; pi++) {
-    var phrases = phraseMap[pi].phrases;
+    var entry = phraseMap[pi];
     var hit = false;
-    for (var pj = 0; pj < phrases.length; pj++) {
-      if (t.indexOf(phrases[pj]) !== -1) { hit = true; break; }
+    for (var pj = 0; pj < entry.phrases.length; pj++) {
+      if (textContainsPhrase(t, entry.phrases[pj])) { hit = true; break; }
     }
     if (!hit) continue;
-    var idx = findMatchingHeader(headers, phraseMap[pi].header);
-    if (idx !== -1 && analysis.targetColumns.indexOf(headers[idx]) === -1) {
-      analysis.targetColumns.push(headers[idx]);
+
+    if (entry.multi) {
+      // 複数列同時に対象（例：発注 → 制作発注 + 発注書）
+      entry.headers.forEach(function(hn) {
+        var ix = findMatchingHeader(headers, hn);
+        if (ix !== -1 && !picked[headers[ix]]) { picked[headers[ix]] = true; analysis.targetColumns.push(headers[ix]); }
+      });
+    } else {
+      var ix = findMatchingHeaderMulti(headers, entry.headers);
+      if (ix !== -1 && !picked[headers[ix]]) { picked[headers[ix]] = true; analysis.targetColumns.push(headers[ix]); }
     }
   }
 
@@ -149,10 +210,10 @@ function analyzeProgressQuestion(text, headers) {
 // rows: シートの全データ行（ヘッダー除く）
 // headers: ヘッダー文字列配列
 function extractProgressItemsByQuestion(rows, headers, analysis) {
-  var idxStore   = findMatchingHeader(headers, '店舗名'); if (idxStore === -1) idxStore = findMatchingHeader(headers, '店舗');
+  var idxStore   = findMatchingHeaderMulti(headers, ['店舗名', '店舗', '店名']);
   var idxMonth   = findMatchingHeader(headers, '施工月');
-  var idxKubun   = findMatchingHeader(headers, '区分');
-  var idxAssign  = findMatchingHeader(headers, '担当者'); if (idxAssign === -1) idxAssign = findMatchingHeader(headers, '担当');
+  var idxKubun   = findMatchingHeaderMulti(headers, ['区分', '理/美', '美/理', '理美', '美理']);
+  var idxAssign  = findMatchingHeaderMulti(headers, ['担当者', '担当']);
   var idxReqDate = findMatchingHeader(headers, '依頼日');
 
   // チェック列の範囲：図面チェック以降。なければ依頼日の次以降。それもなければ全列。
@@ -160,8 +221,12 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
   if (checkStart === -1 && idxReqDate !== -1) checkStart = idxReqDate + 1;
   if (checkStart === -1) checkStart = 0;
 
-  // 依頼日が targetColumns に含まれる場合は「空欄のみ通知」モード
-  var reqDateOnly = analysis.targetColumns.indexOf(idxReqDate !== -1 ? headers[idxReqDate] : '') !== -1;
+  // 日付系列は「空欄のみ通知」（値が入っていれば完了扱い）
+  var dateColIdxs = {};
+  ['依頼日', '納品日時', '完工日'].forEach(function(n) {
+    var i = findMatchingHeader(headers, n);
+    if (i !== -1) dateColIdxs[i] = true;
+  });
 
   var results = [];
 
@@ -169,11 +234,18 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
     var store = idxStore !== -1 ? String(row[idxStore] || '').trim() : '';
     if (!store) return;
 
-    // 月フィルタ
+    // 月フィルタ（Dateオブジェクト・「5月」「5/1」「2025/5/1」いずれも対応）
     if (analysis.monthFilter !== null && idxMonth !== -1) {
-      var mv = String(row[idxMonth] == null ? '' : row[idxMonth]);
-      var monthMatch = mv.match(/(\d{1,2})/);
-      if (!monthMatch || parseInt(monthMatch[1], 10) !== analysis.monthFilter) return;
+      var rawMonth = row[idxMonth];
+      var monthVal = null;
+      if (rawMonth instanceof Date) {
+        monthVal = rawMonth.getMonth() + 1;
+      } else {
+        var mvStr = String(rawMonth == null ? '' : rawMonth);
+        var monthMatch = mvStr.match(/(\d{1,2})月/) || mvStr.match(/\/(\d{1,2})\b/) || mvStr.match(/^(\d{1,2})$/);
+        if (monthMatch) monthVal = parseInt(monthMatch[1], 10);
+      }
+      if (monthVal !== analysis.monthFilter) return;
     }
     // 店舗フィルタ
     if (analysis.storeFilter && store.indexOf(analysis.storeFilter) === -1) return;
@@ -182,22 +254,39 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
       if (String(row[idxAssign] || '').indexOf(analysis.assigneeFilter) === -1) return;
     }
 
+    function fmtCell(v) {
+      if (v == null) return '';
+      if (v instanceof Date) {
+        return Utilities.formatDate(v, 'Asia/Tokyo', 'M/d');
+      }
+      return String(v).trim();
+    }
+    function fmtMonthCell(v) {
+      if (v == null) return '';
+      if (v instanceof Date) return (v.getMonth() + 1) + '月';
+      var s = String(v).trim();
+      if (/^\d{1,2}$/.test(s)) return s + '月';
+      return s;
+    }
     var item = {
       store:       store,
-      month:       idxMonth   !== -1 ? String(row[idxMonth]   == null ? '' : row[idxMonth]).trim()   : '',
-      kubun:       idxKubun   !== -1 ? String(row[idxKubun]   == null ? '' : row[idxKubun]).trim()   : '',
-      assignee:    idxAssign  !== -1 ? String(row[idxAssign]  == null ? '' : row[idxAssign]).trim()  : '',
-      requestDate: idxReqDate !== -1 ? String(row[idxReqDate] == null ? '' : row[idxReqDate]).trim() : '',
+      month:       idxMonth   !== -1 ? fmtMonthCell(row[idxMonth])      : '',
+      kubun:       idxKubun   !== -1 ? fmtCell(row[idxKubun])            : '',
+      assignee:    idxAssign  !== -1 ? fmtCell(row[idxAssign])           : '',
+      requestDate: idxReqDate !== -1 ? fmtCell(row[idxReqDate])          : '',
       pending: [],
     };
-    if (item.month instanceof Date) item.month = String(item.month);
 
     function pushPending(colIdx, colName) {
-      if (colIdx === idxReqDate) {
-        if (!String(row[colIdx] || '').trim()) item.pending.push({ column: colName, value: '未入力' });
+      var v = row[colIdx];
+      // 日付列：値があれば完了、空欄なら未入力として通知
+      if (dateColIdxs[colIdx]) {
+        var hasVal = (v instanceof Date) || String(v == null ? '' : v).trim() !== '';
+        if (!hasVal && !analysis.statusFilter) {
+          item.pending.push({ column: colName, value: '未入力' });
+        }
         return;
       }
-      var v = row[colIdx];
       if (isProgressDone(v)) return;
       var label = progressStatusLabel(v);
       if (analysis.statusFilter && label !== analysis.statusFilter) return;
