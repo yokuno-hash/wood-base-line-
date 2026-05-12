@@ -28,8 +28,9 @@ function getProgressSheet() {
   }
 }
 
-// 完了とみなす値（trimして照合）
-var PROGRESS_DONE_VALUES = ['○', '〇', '丸', '済', '済み', '完了', 'ok', 'OK', 'done', 'Done', '✓', '✔'];
+// 完了とみなす値（trimして照合）。○系の異体字を網羅
+// U+25CB ○ / U+3007 〇 / U+25EF ◯ / U+25CE ◎ / U+24EA Ⓞ
+var PROGRESS_DONE_VALUES = ['○', '〇', '◯', '◎', '丸', '済', '済み', '完了', 'ok', 'OK', 'done', 'Done', '✓', '✔', 'Ⓞ'];
 
 // 完了判定
 function isProgressDone(value) {
@@ -128,9 +129,10 @@ function analyzeProgressQuestion(text, headers) {
   var am = t.match(/([一-龥ぁ-んァ-ヶーA-Za-z]{1,8})さん/);
   if (am) analysis.assigneeFilter = am[1];
 
-  // 店舗「〇〇店」（区分の「美容/理容」だけは除外）
-  var sm = t.match(/([一-龥ぁ-んァ-ヶーA-Za-z0-9]{1,12})店/);
-  if (sm && sm[1] && !/^(美容|理容)$/.test(sm[1])) {
+  // 店舗「〇〇店」抽出（漢字/カタカナ/英数のみ・ひらがな除外で「中の店舗」等の誤検出防止）
+  // また「店舗」「店」単独語、「美容店」「理容店」は除外
+  var sm = t.match(/([一-龥ァ-ヶーｦ-ﾟA-Za-z0-9]{1,12})店(?!舗)/);
+  if (sm && sm[1] && !/^(美容|理容|美|理)$/.test(sm[1])) {
     analysis.storeFilter = sm[1];
   }
 
@@ -234,14 +236,14 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
     var store = idxStore !== -1 ? String(row[idxStore] || '').trim() : '';
     if (!store) return;
 
-    // 月フィルタ（Dateオブジェクト・「5月」「5/1」「2025/5/1」いずれも対応）
+    // 月フィルタ（Date・「5月」「３月」全角数字・「5/1」「2025/5/1」いずれも対応）
     if (analysis.monthFilter !== null && idxMonth !== -1) {
       var rawMonth = row[idxMonth];
       var monthVal = null;
       if (rawMonth instanceof Date) {
         monthVal = rawMonth.getMonth() + 1;
       } else {
-        var mvStr = String(rawMonth == null ? '' : rawMonth);
+        var mvStr = String(rawMonth == null ? '' : rawMonth).normalize('NFKC');
         var monthMatch = mvStr.match(/(\d{1,2})月/) || mvStr.match(/\/(\d{1,2})\b/) || mvStr.match(/^(\d{1,2})$/);
         if (monthMatch) monthVal = parseInt(monthMatch[1], 10);
       }
@@ -279,12 +281,18 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
 
     function pushPending(colIdx, colName) {
       var v = row[colIdx];
-      // 日付列：値があれば完了、空欄なら未入力として通知
+      // 日付列：Date値あり/日付文字列は完了。空欄は未入力。それ以外（確認中等）は通常判定。
       if (dateColIdxs[colIdx]) {
-        var hasVal = (v instanceof Date) || String(v == null ? '' : v).trim() !== '';
-        if (!hasVal && !analysis.statusFilter) {
-          item.pending.push({ column: colName, value: '未入力' });
+        if (v instanceof Date) return;
+        var s = String(v == null ? '' : v).trim();
+        if (!s) {
+          if (!analysis.statusFilter) item.pending.push({ column: colName, value: '未入力' });
+          return;
         }
+        if (/^\d{4}[\/\-年]\d{1,2}[\/\-月]\d{1,2}/.test(s) || /^\d{1,2}[\/月]\d{1,2}/.test(s)) return;
+        if (isProgressDone(s)) return;
+        if (analysis.statusFilter && s !== analysis.statusFilter) return;
+        item.pending.push({ column: colName, value: s });
         return;
       }
       if (isProgressDone(v)) return;
@@ -299,12 +307,18 @@ function extractProgressItemsByQuestion(rows, headers, analysis) {
         if (ci !== -1) pushPending(ci, colName);
       });
     } else {
-      // 全チェック列を見る（属性列は除外）
+      // 全チェック列を見る。属性列・空ヘッダー・属性名の重複列は除外
+      var attrNames = ['施工月','店舗名','店舗','店名','担当者','担当','依頼日','区分','理/美','美/理'];
+      var attrNormSet = {};
+      attrNames.forEach(function(a){ attrNormSet[normalizeHeader(a)] = true; });
       var skipCols = {};
       [idxStore, idxMonth, idxKubun, idxAssign, idxReqDate].forEach(function(i) { if (i !== -1) skipCols[i] = true; });
       for (var ci2 = checkStart; ci2 < headers.length; ci2++) {
         if (skipCols[ci2]) continue;
-        pushPending(ci2, headers[ci2]);
+        var hname = String(headers[ci2] || '').trim();
+        if (!hname) continue;
+        if (attrNormSet[normalizeHeader(hname)]) continue;
+        pushPending(ci2, hname);
       }
     }
 
@@ -357,9 +371,10 @@ function answerProgressQuestion(text) {
   var sheet = getProgressSheet();
   if (!sheet || sheet.getLastRow() < 2) return null;
 
-  var data    = sheet.getDataRange().getValues();
-  var headers = data[0].map(function(h){ return String(h == null ? '' : h).trim(); });
-  var rows    = data.slice(1);
+  var data       = sheet.getDataRange().getValues();
+  var headerRowIdx = findHeaderRowIndex(sheet);
+  var headers    = data[headerRowIdx].map(function(h){ return String(h == null ? '' : h).trim(); });
+  var rows       = data.slice(headerRowIdx + 1);
 
   var analysis = analyzeProgressQuestion(text, headers);
 
@@ -416,6 +431,11 @@ function testProgressQuestion() {
   });
 }
 
+// GASエディタの実行ボタン用：このプロジェクトの進捗管理スプシ・シート名を直接設定
+function setupProgressSpreadsheetForWoodbase() {
+  setupProgressSpreadsheet('1zzA2qSoKZoTBp81BvH4Vl36TdJUuy1F4prjzcKUX-uE', 'プラージュ家具　進捗管理表');
+}
+
 // 別スプシを進捗管理表として登録（GASエディタから1回実行）
 // 例: setupProgressSpreadsheet('1zzA2qSoKZoTBp81BvH4Vl36TdJUuy1F4prjzcKUX-uE', '進捗管理表');
 function setupProgressSpreadsheet(spreadsheetId, sheetName) {
@@ -448,6 +468,38 @@ function showProgressSpreadsheet() {
   var sh = getProgressSheet();
   if (sh) console.log('解決後:', sh.getParent().getName(), '/', sh.getName(), '/ 行数:', sh.getLastRow());
   else    console.log('シート解決失敗');
+}
+
+// 診断：シートの先頭5行を表示してヘッダー行を特定する
+function diagnoseProgressSheet() {
+  var sh = getProgressSheet();
+  if (!sh) { console.error('シート未接続'); return; }
+  console.log('シート:', sh.getParent().getName(), '/', sh.getName());
+  console.log('行数:', sh.getLastRow(), '列数:', sh.getLastColumn());
+  var n = Math.min(8, sh.getLastRow());
+  var data = sh.getRange(1, 1, n, sh.getLastColumn()).getValues();
+  for (var i = 0; i < data.length; i++) {
+    console.log('行' + (i + 1) + ':', JSON.stringify(data[i].map(function(c){
+      if (c instanceof Date) return Utilities.formatDate(c, 'Asia/Tokyo', 'yyyy/M/d');
+      return c;
+    })));
+  }
+}
+
+// ヘッダー行のインデックスを自動推定（「店舗名」または「図面チェック」を含む最初の行）
+function findHeaderRowIndex(sh) {
+  var maxScan = Math.min(10, sh.getLastRow());
+  var data = sh.getRange(1, 1, maxScan, sh.getLastColumn()).getValues();
+  var keywords = ['店舗名', '店舗', '図面チェック', '図面', '施工月', '依頼日'];
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i].map(function(c){ return String(c == null ? '' : c).normalize('NFKC'); });
+    var hits = 0;
+    keywords.forEach(function(k){
+      if (row.some(function(c){ return c.indexOf(k) !== -1; })) hits++;
+    });
+    if (hits >= 2) return i; // 0-indexed
+  }
+  return 0;
 }
 
 // ヘッダーマッチのみ単体テスト（シート不要）
