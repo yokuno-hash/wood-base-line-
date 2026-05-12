@@ -11,6 +11,23 @@
 
 var PROGRESS_SHEET_NAME = '進捗管理表';
 
+// 進捗管理表シートを取得（別スプシ対応）
+// スクリプトプロパティ PROGRESS_SPREADSHEET_ID が設定されていればそのスプシを開く。
+// 未設定なら既存のメインスプシ（SPREADSHEET_ID）を使う。
+// シート名は PROGRESS_SHEET_NAME_OVERRIDE があればそちら、なければ PROGRESS_SHEET_NAME。
+function getProgressSheet() {
+  var props      = PropertiesService.getScriptProperties();
+  var extId      = props.getProperty('PROGRESS_SPREADSHEET_ID');
+  var sheetName  = props.getProperty('PROGRESS_SHEET_NAME_OVERRIDE') || PROGRESS_SHEET_NAME;
+  try {
+    var ss = extId ? SpreadsheetApp.openById(extId) : getSS();
+    return ss.getSheetByName(sheetName);
+  } catch (err) {
+    console.error('getProgressSheet error:', err.message);
+    return null;
+  }
+}
+
 // 完了とみなす値（trimして照合）
 var PROGRESS_DONE_VALUES = ['○', '〇', '丸', '済', '済み', '完了', 'ok', 'OK', 'done', 'Done', '✓', '✔'];
 
@@ -248,7 +265,7 @@ function formatProgressQuestionAnswer(results, analysis) {
 
 // 進捗質問エントリ：質問でなければnull、質問なら回答テキスト返却
 function answerProgressQuestion(text) {
-  var sheet = getSheet(PROGRESS_SHEET_NAME);
+  var sheet = getProgressSheet();
   if (!sheet || sheet.getLastRow() < 2) return null;
 
   var data    = sheet.getDataRange().getValues();
@@ -290,8 +307,9 @@ function handleProgressQuestionRequest(event, messageText) {
 // テスト
 // ==========================================
 function testProgressQuestion() {
-  var sheet = getSheet(PROGRESS_SHEET_NAME);
-  if (!sheet) { console.error('「' + PROGRESS_SHEET_NAME + '」シートが存在しません'); return; }
+  var sheet = getProgressSheet();
+  if (!sheet) { console.error('進捗管理表シートが見つかりません（PROGRESS_SPREADSHEET_ID / シート名を確認）'); return; }
+  console.log('対象スプシ:', sheet.getParent().getName(), '/ シート:', sheet.getName());
   var cases = [
     '図面チェックできてない店舗ある？',
     '依頼日入ってない店舗ある？',
@@ -307,6 +325,40 @@ function testProgressQuestion() {
     console.log(ans || '（対象外と判定）');
     console.log('---');
   });
+}
+
+// 別スプシを進捗管理表として登録（GASエディタから1回実行）
+// 例: setupProgressSpreadsheet('1zzA2qSoKZoTBp81BvH4Vl36TdJUuy1F4prjzcKUX-uE', '進捗管理表');
+function setupProgressSpreadsheet(spreadsheetId, sheetName) {
+  if (!spreadsheetId) { console.error('spreadsheetId が必要です'); return; }
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('PROGRESS_SPREADSHEET_ID', String(spreadsheetId));
+  if (sheetName) props.setProperty('PROGRESS_SHEET_NAME_OVERRIDE', String(sheetName));
+
+  // 動作確認：開けるか・対象シートが存在するか
+  try {
+    var ss = SpreadsheetApp.openById(spreadsheetId);
+    var target = sheetName || PROGRESS_SHEET_NAME;
+    var sh = ss.getSheetByName(target);
+    if (!sh) {
+      console.error('スプシは開けましたが「' + target + '」シートが見つかりません。シート名を確認してください。');
+      console.log('利用可能シート:', ss.getSheets().map(function(s){ return s.getName(); }).join(', '));
+      return;
+    }
+    console.log('✅ 設定完了:', ss.getName(), '/', sh.getName(), '/ 行数:', sh.getLastRow());
+  } catch (err) {
+    console.error('開けませんでした。共有設定（GAS実行アカウントに閲覧権限）と ID を確認してください。', err.message);
+  }
+}
+
+// 進捗管理表の現在の接続先を確認
+function showProgressSpreadsheet() {
+  var props = PropertiesService.getScriptProperties();
+  console.log('PROGRESS_SPREADSHEET_ID:', props.getProperty('PROGRESS_SPREADSHEET_ID') || '(未設定 → メインスプシを使用)');
+  console.log('PROGRESS_SHEET_NAME_OVERRIDE:', props.getProperty('PROGRESS_SHEET_NAME_OVERRIDE') || '(未設定 → ' + PROGRESS_SHEET_NAME + ')');
+  var sh = getProgressSheet();
+  if (sh) console.log('解決後:', sh.getParent().getName(), '/', sh.getName(), '/ 行数:', sh.getLastRow());
+  else    console.log('シート解決失敗');
 }
 
 // ヘッダーマッチのみ単体テスト（シート不要）
