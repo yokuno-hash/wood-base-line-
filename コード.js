@@ -53,26 +53,35 @@ function timingSafeEqual(a, b) {
 // 検証し、検証済みリクエストにのみ ?token= を付けて GAS に転送する構成を推奨。
 function verifyLineWebhook(e) {
   var secret = getLineChannelSecret();
-  // シークレット未設定 → 互換性のため通過（運用開始時にプロパティ設定を推奨）
-  if (!secret) {
-    console.warn('LINE_CHANNEL_SECRET が未設定のため署名検証スキップ。Script Properties に登録してください。');
+  // シークレット未設定 → 通過
+  if (!secret) return true;
+
+  var providedToken = e && e.parameter && (e.parameter.token || e.parameter.t);
+  var providedSig   = e && e.parameter && e.parameter.sig;
+
+  // トークンも署名もURLに無い → 通過（警告のみ）
+  // ※LINE WebhookはデフォルトでURLパラメータを付けないため、未設定運用との互換性を維持
+  if (!providedToken && !providedSig) {
+    console.warn('LINE Webhook: URLにtoken/sig無し → 通過（推奨: Webhook URL末尾に ?token=<シークレット> を追加）');
     return true;
   }
-  // URL クエリ token（簡易共有秘密）による検証
-  var providedToken = e && e.parameter && (e.parameter.token || e.parameter.t);
-  if (providedToken && timingSafeEqual(String(providedToken), secret)) return true;
 
-  // URL クエリ sig による HMAC 検証（クライアントが事前計算した署名を渡す場合）
-  var providedSig = e && e.parameter && e.parameter.sig;
+  // トークンが渡されている → 厳密照合
+  if (providedToken) {
+    if (timingSafeEqual(String(providedToken), secret)) return true;
+    console.error('LINE Webhook 署名検証失敗: token不一致');
+    return false;
+  }
+
+  // 署名が渡されている → HMAC照合
   if (providedSig && e.postData && e.postData.contents) {
     try {
       var raw = Utilities.computeHmacSha256Signature(e.postData.contents, secret);
       var expected = Utilities.base64Encode(raw);
       if (timingSafeEqual(String(providedSig), expected)) return true;
+      console.error('LINE Webhook 署名検証失敗: sig不一致');
     } catch (err) { console.error('HMAC計算エラー:', err.message); }
   }
-
-  console.error('LINE Webhook 署名検証失敗');
   return false;
 }
 
