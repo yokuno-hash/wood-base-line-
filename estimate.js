@@ -276,6 +276,12 @@ function getEstimateRate(settingId, category, drawingName, rateSettings) {
 // SECTION: 集計計算
 // ==========================================
 
+// 計算ルール（東邦家具・統一版）：
+//   金額 = 製図時間 × HOURLY_RATE（新規・修正とも共通）
+//   修正: 数量=製図時間 / 単位=H / 単価=HOURLY_RATE / 金額=製図時間×HOURLY_RATE
+//   新規: 数量=枚数      / 単位=枚 / 単価=空欄        / 金額=製図時間×HOURLY_RATE
+var HOURLY_RATE = 5000;
+
 function calculateEstimateData(groups, rateSettings, settingId) {
   var properties   = [];
   var confirmItems = [];
@@ -288,38 +294,46 @@ function calculateEstimateData(groups, rateSettings, settingId) {
     var detailItems = [];
 
     g.rows.forEach(function(r){
-      var amount  = 0;
-      var qty     = 0;
-      var unit    = '';
-      var unitPrice = 0;
+      var detail = { name: '', qty: '', unit: '', unitPrice: '', amount: 0 };
       var confirm = '';
 
       if (!r.category) {
         confirm = '分類が空欄';
+        detail.name = r.drawingName || '(図面名空欄)';
       } else if (r.category === '修正') {
-        if (!r.time) { confirm = '製図時間が空欄'; }
-        else {
-          qty = r.time; unit = 'H'; unitPrice = 5000; amount = qty * unitPrice;
+        if (!r.time) {
+          confirm = '製図時間が空欄';
+          detail.name = (r.drawingName || '') + ' 修正';
+        } else {
+          detail.name      = (r.drawingName || '') + ' 修正';
+          detail.qty       = r.time;
+          detail.unit      = 'H';
+          detail.unitPrice = HOURLY_RATE;
+          detail.amount    = r.time * HOURLY_RATE;
           fixHours += r.time;
         }
       } else if (r.category === '新規') {
-        if (!r.count) { confirm = '枚数が空欄'; }
-        else {
-          var rate = getEstimateRate(settingId, '新規', r.drawingName, rateSettings);
-          if (!rate || !rate.rate) {
-            confirm = '新規単価が見つかりません';
-            qty = r.count; unit = '枚';
-          } else {
-            qty = r.count; unit = rate.unit || '枚'; unitPrice = rate.rate; amount = qty * unitPrice;
-            newSheets += r.count;
-          }
+        if (!r.time) {
+          confirm = '製図時間が空欄（金額計算不可）';
+          detail.name = (r.drawingName || '') + ' 新規';
+          detail.qty  = r.count || '';
+          detail.unit = '枚';
+        } else {
+          detail.name      = (r.drawingName || '') + ' 新規';
+          detail.qty       = r.count || '';
+          detail.unit      = '枚';
+          detail.unitPrice = ''; // 新規は単価欄空欄（仕様）
+          detail.amount    = r.time * HOURLY_RATE;
+          newSheets += r.count || 0;
         }
       } else if (r.category === '検討のみ' || r.category === 'WBF') {
         confirm = r.category + '：請求対象不明';
-        qty = r.count || r.time || 0;
-        unit = r.count ? '枚' : (r.time ? 'H' : '');
+        detail.name = (r.drawingName || '') + ' ' + r.category;
+        detail.qty  = r.count || r.time || '';
+        detail.unit = r.count ? '枚' : (r.time ? 'H' : '');
       } else {
         confirm = '未対応の分類「' + r.category + '」';
+        detail.name = (r.drawingName || '') + ' ' + r.category;
       }
 
       if (confirm) {
@@ -332,23 +346,16 @@ function calculateEstimateData(groups, rateSettings, settingId) {
         });
       }
 
-      detailItems.push({
-        name:      r.drawingName + (r.category ? '　' + r.category : ''),
-        qty:       qty,
-        unit:      unit,
-        unitPrice: unitPrice,
-        amount:    amount,
-      });
-      totalAmount += amount;
+      detailItems.push(detail);
+      totalAmount += detail.amount;
     });
 
-    // 名称生成（【物件番号】物件名 (新規〇枚／修正〇時間)）
+    // 名称：【物件番号】物件名（新規〇枚／修正〇時間）
     var suffixParts = [];
     if (newSheets > 0) suffixParts.push('新規' + newSheets + '枚');
     if (fixHours  > 0) suffixParts.push('修正' + fixHours + '時間');
-    var propLabel = g.property;
-    // 「様邸」「邸」「PJ」が既にあれば重複させない（明示的な追加はしない方針）
-    var coverName = '【' + (g.propertyNo || '') + '】' + propLabel + (suffixParts.length ? '（' + suffixParts.join('／') + '）' : '');
+    var coverName = '【' + (g.propertyNo || '') + '】' + g.property +
+                    (suffixParts.length ? '（' + suffixParts.join('／') + '）' : '');
 
     properties.push({
       propertyNo:  g.propertyNo,
@@ -388,8 +395,9 @@ function copyEstimateTemplateSheet(estimateSpreadsheetId, templateSheetName, new
   if (!tpl) throw new Error('テンプレートシート「' + templateSheetName + '」が見つかりません');
   var copy = tpl.copyTo(ss);
   copy.setName(newSheetName);
-  // 末尾→先頭側に寄せる
+  // テンプレートシートの直後（右隣）に配置
   ss.setActiveSheet(copy);
+  ss.moveActiveSheet(tpl.getIndex() + 1);
   return { existing: false, ss: ss, sheet: copy };
 }
 
@@ -420,19 +428,20 @@ function writeEstimateCover(targetSheet, estimateData, setting) {
 
 function writeEstimateDetails(targetSheet, estimateData, setting) {
   var row = DETAIL_START_ROW;
-  var seq = 0;
-  estimateData.properties.forEach(function(p){
-    // 物件見出し（名称列のみ・太字）
-    targetSheet.getRange(row, DETAIL_COL_NAME).setValue('【' + (p.propertyNo || '') + '】' + p.property);
+  estimateData.properties.forEach(function(p, pIdx){
+    // 物件見出し：「1　物件名」形式（連番+全角空白+物件名）。番号列は使わず名称列のみ。
+    targetSheet.getRange(row, DETAIL_COL_NAME).setValue((pIdx + 1) + '　' + p.property);
     targetSheet.getRange(row, DETAIL_COL_NAME).setFontWeight('bold');
     row++;
+    var seqInProperty = 0;
     p.detailItems.forEach(function(d){
-      seq++;
-      targetSheet.getRange(row, DETAIL_COL_NO).setValue(seq);
+      seqInProperty++;
+      targetSheet.getRange(row, DETAIL_COL_NO).setValue(seqInProperty);
       targetSheet.getRange(row, DETAIL_COL_NAME).setValue(d.name);
-      targetSheet.getRange(row, DETAIL_COL_QTY).setValue(d.qty || '');
+      // 数量・単価は空文字列「''」だと0扱いされる場合があるため明示的にsetValue
+      targetSheet.getRange(row, DETAIL_COL_QTY).setValue(d.qty === '' ? '' : d.qty);
       targetSheet.getRange(row, DETAIL_COL_UNIT).setValue(d.unit || '');
-      targetSheet.getRange(row, DETAIL_COL_UNITPRICE).setValue(d.unitPrice || '');
+      targetSheet.getRange(row, DETAIL_COL_UNITPRICE).setValue(d.unitPrice === '' ? '' : d.unitPrice);
       targetSheet.getRange(row, DETAIL_COL_AMOUNT).setValue(d.amount || '');
       row++;
     });
@@ -674,6 +683,39 @@ function diagnoseEstimateTemplate(settingId) {
     }
   }
 }
+
+// 計算根拠の詳細ログ（どの行がいくらになったか・どの単価ルールが当たったか）
+function explainEstimateForToho(month) {
+  month = month || 5;
+  var setting = findEstimateSettingFromMessage('東邦家具');
+  if (!setting) { console.error('toho 設定なし'); return; }
+  var ym = { year: new Date().getFullYear(), month: month };
+  var processData = getProcessRowsBySetting(setting);
+  var all = normalizeProcessRows(processData);
+  var target = filterRowsByTargetMonth(all, ym.year, ym.month);
+  var rateSettings = getEstimateRateSettings();
+
+  console.log('=== ' + ym.year + '年' + ym.month + '月 計算根拠 ===');
+  console.log('対象行数:', target.length);
+  var subtotal = 0;
+  target.forEach(function(r, i){
+    var amount = 0, qty = '', unit = '', up = '', reason = '';
+    if (r.category === '修正') {
+      if (r.time) { qty = r.time; unit = 'H'; up = HOURLY_RATE; amount = r.time * HOURLY_RATE; reason = '修正'; }
+      else { reason = '修正だが製図時間空欄'; }
+    } else if (r.category === '新規') {
+      if (r.time) { qty = r.count; unit = '枚'; up = ''; amount = r.time * HOURLY_RATE; reason = '新規(時間' + r.time + 'H×' + HOURLY_RATE + ')'; }
+      else { reason = '新規だが製図時間空欄'; }
+    } else {
+      reason = '分類「' + r.category + '」自動計算なし';
+    }
+    console.log((i + 1) + '. ' + r.property + ' / ' + r.drawingName + ' / ' + r.category +
+                ' → 数量' + qty + unit + ' / 単価' + up + ' / 金額¥' + amount + '  [' + reason + ']');
+    subtotal += amount;
+  });
+  console.log('小計:', subtotal, '消費税:', Math.round(subtotal * TAX_RATE), '税込:', subtotal + Math.round(subtotal * TAX_RATE));
+}
+function explainEstimateForToho_May() { explainEstimateForToho(5); }
 
 // LINE送信を伴わないドライラン
 function testEstimateDryRun() {
