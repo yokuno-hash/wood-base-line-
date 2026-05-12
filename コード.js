@@ -109,10 +109,10 @@ function handleDM(ev, userId, groupId, sender, text, ts) {
     sendLineReply(ev.replyToken, 'WOODBASE秘書AIにご登録いただきました。\nタスクが割り当てられた際にはお知らせいたします。\n\n「残タスクは？」「今週の予定は？」とお送りいただくとご確認いただけます。');
     return;
   }
+  // 進捗管理表への自然文クエリ（完了報告誤判定より先に処理）
+  if (handleProgressQuestionRequest(ev, text)) return;
   if (isCompletionReport(text)) { handleCompletion(text, sender, ev.replyToken); return; }
   if (isSummaryRequest(text)) { sendLineReply(ev.replyToken, '【会話まとめ】\n' + summarizeChat(userId)); return; }
-  // 進捗管理表への自然文クエリ
-  if (handleProgressQuestionRequest(ev, text)) return;
   sendLineReply(ev.replyToken, answerQueryForMember(text, sender));
 }
 
@@ -149,18 +149,18 @@ function handleMentionCommand(ev, groupId, userId, sender, text, ts) {
     sendLineReply(ev.replyToken, '【会話まとめ】\n' + summarizeChat(groupId));
     return;
   }
-  // ③ 完了報告
+  // ③ 進捗管理表への自然文クエリ（完了報告誤判定より先に処理）
+  if (handleProgressQuestionRequest(ev, text)) return;
+  // ④ 完了報告
   if (isCompletionReport(text)) {
     handleCompletion(text, sender, ev.replyToken);
     return;
   }
-  // ④ 仮タスク確認
+  // ⑤ 仮タスク確認
   if (text.includes('仮タスク')) {
     handlePendingList(ev.replyToken, groupId);
     return;
   }
-  // ④-b 進捗管理表への自然文クエリ（タスク照会より先に判定）
-  if (handleProgressQuestionRequest(ev, text)) return;
   // ④-c タスク・スケジュール照会
   if (isQuery(text)) {
     sendLineReply(ev.replyToken, answerQuery(text));

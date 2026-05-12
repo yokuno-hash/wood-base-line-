@@ -28,21 +28,29 @@ function getProgressSheet() {
   }
 }
 
-// 完了とみなす値（trimして照合）。○系の異体字を網羅
-// U+25CB ○ / U+3007 〇 / U+25EF ◯ / U+25CE ◎ / U+24EA Ⓞ
-var PROGRESS_DONE_VALUES = ['○', '〇', '◯', '◎', '丸', '済', '済み', '完了', 'ok', 'OK', 'done', 'Done', '✓', '✔', 'Ⓞ'];
+// 完了とみなすテキスト値
+var PROGRESS_DONE_TEXTS = ['丸', 'まる', 'マル', '済', '済み', '完了', '完', 'ok', 'OK', 'done', 'Done', '✓', '✔', '✅', 'Ⓞ', '対応済', '済済'];
 
-// 完了判定
+// 丸系のUnicode文字（円・丸記号のあらゆる異体字）
+// U+25CB ○ / U+3007 〇 / U+25EF ◯ / U+25CE ◎ / U+26AA ⚪ / U+26AB ⚫ / U+25CF ●
+// U+2B24 ⬤ / U+2B55 ⭕ / U+24EA Ⓞ / U+24C4 Ⓞ / U+25C9 ◉ / U+25EC ◬ / U+2299 ⊙
+var PROGRESS_CIRCLE_REGEX = /^[○〇◯◎⚪⚫●⬤⭕⓪Ⓞ◉⊙]+$/;
+
+// 完了判定（trimして照合・各種丸記号と完了テキストを許容）
 function isProgressDone(value) {
-  var v = String(value == null ? '' : value).trim();
+  var v = String(value == null ? '' : value).replace(/^[\s　]+|[\s　]+$/g, '');
   if (!v) return false;
+  if (PROGRESS_CIRCLE_REGEX.test(v)) return true;
   var lc = v.toLowerCase();
-  for (var i = 0; i < PROGRESS_DONE_VALUES.length; i++) {
-    var d = PROGRESS_DONE_VALUES[i];
+  for (var i = 0; i < PROGRESS_DONE_TEXTS.length; i++) {
+    var d = PROGRESS_DONE_TEXTS[i];
     if (v === d || lc === String(d).toLowerCase()) return true;
   }
   return false;
 }
+
+// 既存互換のため変数名は残す（未使用）
+var PROGRESS_DONE_VALUES = PROGRESS_DONE_TEXTS;
 
 function progressStatusLabel(value) {
   var v = String(value == null ? '' : value).trim();
@@ -343,7 +351,7 @@ function formatProgressQuestionAnswer(results, analysis) {
     headerLine = '【未完了・要確認】';
   }
 
-  var MAX = 20;
+  var MAX = 30;
   var lines = [headerLine];
   results.slice(0, MAX).forEach(function(it) {
     lines.push('');
@@ -351,7 +359,6 @@ function formatProgressQuestionAnswer(results, analysis) {
     if (it.month)       lines.push('施工月：' + it.month);
     if (it.kubun)       lines.push('区分：' + it.kubun);
     if (it.assignee)    lines.push('担当：' + it.assignee);
-    if (it.requestDate && analysis.targetColumns.indexOf('依頼日') === -1) lines.push('依頼日：' + it.requestDate);
 
     if (analysis.targetColumns.length === 1 && it.pending.length === 1) {
       lines.push('状態：' + it.pending[0].value);
@@ -362,7 +369,10 @@ function formatProgressQuestionAnswer(results, analysis) {
       it.pending.forEach(function(p) { lines.push('・' + p.column + '：' + p.value); });
     }
   });
-  if (results.length > MAX) lines.push('\n…ほか ' + (results.length - MAX) + ' 件');
+  if (results.length > MAX) {
+    var rest = results.slice(MAX).map(function(it) { return it.store; }).join('、');
+    lines.push('\n…ほか ' + (results.length - MAX) + ' 件：' + rest);
+  }
   return lines.join('\n');
 }
 
@@ -378,14 +388,31 @@ function answerProgressQuestion(text) {
 
   var analysis = analyzeProgressQuestion(text, headers);
 
-  // トリガー判定：列マッチ・月・店舗・担当者・状態のいずれか or 明示キーワード
-  var triggered =
+  // タスク登録メッセージは絶対に進捗質問扱いしない
+  var hasTaskVerb = /(お願い|頼みま|頼む|依頼しま|依頼しと|してお|しといて|しといで|送っと|送って[くだ]|連絡しと|連絡して|対応して|登録して|入れと|やっとく|やってお|やっとき|やります|でお願い|完了したよ|完了です|終わ(りまし|った))/.test(text);
+  if (hasTaskVerb) return null;
+
+  // 明示的進捗キーワード
+  var explicitProgress = /未完了|まとめて|一覧|全部|全て|進捗管理|残ってる|残ってない|○ついて(い)?ない|まる(つい|入っ)てない|空欄/.test(text);
+
+  // クエリ動詞（質問形）
+  var hasQueryVerb =
+       /(ある[?？]?|ない[?？]?|教え|まだ|どこ|どれ|どう|何件|何個|いくつ|表示|出して|出せ|だして|だせ)/.test(text)
+    || /[?？]/.test(text);
+
+  var hasFilter =
        analysis.targetColumns.length > 0
     || analysis.monthFilter   !== null
     || analysis.storeFilter   !== null
     || analysis.assigneeFilter!== null
-    || analysis.statusFilter  !== null
-    || /未完了|まとめて|一覧|全部|全て|進捗管理|残ってる|残ってない|○ついてない|まる(つい|入っ)てない/.test(text);
+    || analysis.statusFilter  !== null;
+
+  // 進捗質問として扱う条件：
+  //   ① 明示キーワード（未完了/まとめて等）が含まれる → 即発火
+  //   ② フィルタ条件あり ＋ クエリ動詞 ＋ 進捗関連シグナル
+  var progressSignal = analysis.targetColumns.length > 0 || analysis.statusFilter !== null
+                     || /進捗|どうなって|状況|状態|店舗/.test(text);
+  var triggered = explicitProgress || (hasFilter && hasQueryVerb && progressSignal);
 
   if (!triggered) return null;
 
