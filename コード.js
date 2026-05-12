@@ -81,6 +81,14 @@ function handleEvent(ev) {
 
   saveMessageLog(groupId, sender, text, ts);
 
+  // 新規プロジェクト名入力モードのチェック（修正モードより優先）
+  var newProjBatchId = getNewProjectMode(userId);
+  if (newProjBatchId) {
+    clearNewProjectMode(userId);
+    finalizeNewProject(text, newProjBatchId, groupId, userId, ev.replyToken);
+    return;
+  }
+
   // 修正（再入力）モードのチェック
   var retryBatchId = getRetryMode(userId);
   if (retryBatchId) {
@@ -159,26 +167,41 @@ function handleMentionCommand(ev, groupId, userId, sender, text, ts) {
   if (!shouldSkipExtraction(text)) {
     var extracted = extractWithGemini(text, groupId, ts, sender);
     if (extracted && (extracted.tasks.length + extracted.schedules.length > 0)) {
-      var proj = identifyProject(text, groupId, extracted.projectNameHint);
-
       // 曖昧な予定（5W1H不足）は質問を返す
       var question = buildAmbiguityQuestion(extracted);
       if (question) {
-        var batchId = storePending(extracted, proj.name, groupId, userId, text);
-        setRetryMode(userId, batchId);
+        var bidQ = storePending(extracted, '', groupId, userId, text);
+        setRetryMode(userId, bidQ);
         sendLineReply(ev.replyToken, question);
         return;
       }
 
-      // 明確なタスク・予定 → 即登録＋取消ボタン
-      var registered = commitDirectly(extracted, proj.name, groupId, userId);
-      if (registered.tasks.length || registered.schedules.length) {
-        var cancelKey = saveCancelInfo(registered);
-        sendQuickReply(ev.replyToken,
-          buildRegisteredMsg(registered) + '\n\n間違いがあれば取消できます。',
-          [{ type: 'action', action: { type: 'postback', label: '↩️ 取消', data: 'action=cancel&key=' + cancelKey } }]
-        );
+      // グループが特定プロジェクトに紐付け済み → 従来通り即登録（明示的紐付けのため）
+      var boundProject = getProjectNameByGroupId(groupId);
+      if (boundProject) {
+        var registered = commitDirectly(extracted, boundProject, groupId, userId);
+        if (registered.tasks.length || registered.schedules.length) {
+          var cancelKey = saveCancelInfo(registered);
+          sendQuickReply(ev.replyToken,
+            buildRegisteredMsg(registered) + '\n\n間違いがあれば取消できます。',
+            [{ type: 'action', action: { type: 'postback', label: '↩️ 取消', data: 'action=cancel&key=' + cancelKey } }]
+          );
+        }
+        return;
       }
+
+      // グループ未紐付け → 必ずユーザーに保存先を選んでもらう（AI自動確定しない）
+      var batchId = storePending(extracted, '', groupId, userId, text);
+      var allProjects = getProjectData();
+      if (!allProjects.length) {
+        // 既存プロジェクトが1件もない → 新規作成プロンプトへ直行
+        setNewProjectMode(userId, batchId);
+        sendLineReply(ev.replyToken,
+          '【新規プロジェクト作成】\n保存先のプロジェクト名を次のメッセージでご入力ください（10分以内、「キャンセル」で中止）。');
+        return;
+      }
+      var candidates = getProjectCandidates(text, groupId, extracted.projectNameHint, 4);
+      sendProjectSelectUI(ev.replyToken, extracted, batchId, candidates, groupId, extracted.projectNameHint);
       return;
     }
   }
@@ -519,6 +542,64 @@ function matchProjectByName(name, projects) {
   return best;
 }
 
+// プロジェクト候補を信頼度順に返す（最大limit件）
+// AIによる自動確定は行わず、ユーザーに選んでもらうための候補リスト
+function getProjectCandidates(text, groupId, geminiHint, limit) {
+  limit = limit || 4;
+  var projects = getProjectData();
+  if (!projects.length) return [];
+
+  var cleanText = String(text || '').replace(/\s/g, '');
+  var cleanHint = String(geminiHint || '').replace(/\s/g, '');
+  var scored = [];
+
+  for (var i = 0; i < projects.length; i++) {
+    var formal = String(projects[i][1] || '').replace(/\s/g, '');
+    var abbr   = String(projects[i][0] || '').replace(/\s/g, '');
+    var status = String(projects[i][4] || '');
+    if (!formal) continue;
+    if (status && status !== '進行中') continue;
+
+    var score = 0;
+    var reason = '';
+    if (cleanText && cleanText.includes(formal))                       { score = 90; reason = '正式名一致'; }
+    else if (abbr.length >= 2 && cleanText.includes(abbr))             { score = 82; reason = '略称一致'; }
+    else {
+      var sub = longestCommonSubstring(formal, cleanText);
+      if (sub >= 5)      { score = 72; reason = '部分一致' + sub + '文字'; }
+      else if (sub >= 4) { score = 60; reason = '部分一致' + sub + '文字'; }
+      else if (sub >= 3) { score = 45; reason = '部分一致' + sub + '文字'; }
+      if (abbr.length >= 2) {
+        var subA = longestCommonSubstring(abbr, cleanText);
+        if (subA >= abbr.length && 75 > score) { score = 75; reason = '略称含有'; }
+        else if (subA >= 3 && 55 > score)      { score = 55; reason = '略称部分一致'; }
+      }
+    }
+    if (cleanHint) {
+      if (formal === cleanHint || abbr === cleanHint) {
+        if (score < 85) { score = 85; reason = 'AIヒント一致'; }
+      } else if (formal.includes(cleanHint) || cleanHint.includes(formal)) {
+        if (score < 68) { score = 68; reason = 'AIヒント部分一致'; }
+      }
+    }
+    if (score > 0) scored.push({ name: formal, confidence: score, reason: reason });
+  }
+
+  scored.sort(function(a, b) { return b.confidence - a.confidence; });
+
+  // 候補が少ない場合は進行中の他案件で埋める（誤名寄せ防止のため必ず複数提示）
+  if (scored.length < Math.min(limit, 3)) {
+    var active = getActiveProjects(limit + 2);
+    for (var k = 0; k < active.length && scored.length < limit; k++) {
+      var n = active[k];
+      var exists = scored.some(function(s) { return s.name === n; });
+      if (!exists) scored.push({ name: n, confidence: 0, reason: '進行中案件' });
+    }
+  }
+
+  return scored.slice(0, limit);
+}
+
 // 進行中のプロジェクト一覧（最新N件・Quick Reply用）
 function getActiveProjects(limit) {
   var sheet = getSheet('プロジェクト管理');
@@ -589,37 +670,55 @@ function sendConfirmUI(replyToken, extracted, projectName, batchId) {
   ]);
 }
 
-// 案件が不明な場合・案件選択UIを先に表示（ワンタップで案件確定）
-function sendProjectSelectUI(replyToken, extracted, batchId) {
+// 案件選択UI：候補プロジェクト + 「新規プロジェクト作成」を必ず表示
+// candidatesが空の場合はgetProjectCandidatesで自動取得
+function sendProjectSelectUI(replyToken, extracted, batchId, candidates, groupId, geminiHint) {
   if (!replyToken) return;
-  var summary = buildItemSummary(extracted);
-  var text    = '【タスク／予定を検出いたしました】\n\n' + summary + '\n\nどの案件に登録しますか？（タップでご選択ください）';
+  if (!candidates) candidates = getProjectCandidates('', groupId || '', geminiHint || '', 4);
 
-  var projects = getActiveProjects(11); // 最大11件（+未分類で12件）
-  var items = projects.map(function(name) {
-    var label = name.length > 20 ? name.slice(0, 19) + '…' : name;
+  var summary = buildItemSummary(extracted);
+  var lines   = ['【保存先プロジェクトをご選択ください】', '', summary, ''];
+  if (candidates.length) {
+    lines.push('候補：');
+    candidates.forEach(function(c, i) { lines.push((i + 1) + '. ' + c.name); });
+    lines.push((candidates.length + 1) + '. 🆕 新規プロジェクトとして作成');
+  } else {
+    lines.push('既存の候補プロジェクトが見つかりませんでした。');
+    lines.push('「🆕 新規プロジェクト作成」をご選択ください。');
+  }
+  lines.push('\n※類似名でも別案件として管理したい場合は新規作成をお選びください。');
+
+  var items = candidates.map(function(c) {
+    var label = c.name.length > 18 ? c.name.slice(0, 17) + '…' : c.name;
     return {
       type: 'action',
       action: {
         type: 'postback',
         label: label,
-        data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent(name),
-        displayText: name + 'に登録します',
+        data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent(c.name),
+        displayText: c.name + 'に保存します',
       },
     };
   });
-
-  // 未分類を末尾に追加
   items.push({
     type: 'action',
     action: {
       type: 'postback',
-      label: '📁 未分類',
-      data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent('未分類'),
+      label: '🆕 新規プロジェクト作成',
+      data: 'action=new_project&batch=' + batchId,
+      displayText: '新規プロジェクトを作成します',
+    },
+  });
+  items.push({
+    type: 'action',
+    action: {
+      type: 'postback',
+      label: '❌ 無視',
+      data: 'action=ignore&batch=' + batchId,
     },
   });
 
-  sendQuickReply(replyToken, text, items);
+  sendQuickReply(replyToken, lines.join('\n'), items);
 }
 
 // 抽出内容を短くまとめたテキスト（案件選択UIに表示）
@@ -688,14 +787,14 @@ function sendConfirmToDM(userId, extracted, proj, batchId) {
       { type: 'action', action: { type: 'postback', label: '❌ 無視', data: 'action=ignore&batch=' + batchId } },
     ];
   } else {
-    // 案件不明 → 案件選択 → 登録
-    lines.push('\nどの案件に登録しますか？（タップでご選択ください）');
-    var projects = getActiveProjects(11);
-    projects.forEach(function(name) {
-      var label = name.length > 20 ? name.slice(0, 19) + '…' : name;
-      items.push({ type: 'action', action: { type: 'postback', label: label, data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent(name), displayText: name + 'に登録します' } });
+    // 案件不明 → 候補 + 新規作成 から選択
+    lines.push('\n保存先プロジェクトをご選択ください。');
+    var cands = getProjectCandidates('', '', '', 4);
+    cands.forEach(function(c) {
+      var label = c.name.length > 18 ? c.name.slice(0, 17) + '…' : c.name;
+      items.push({ type: 'action', action: { type: 'postback', label: label, data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent(c.name), displayText: c.name + 'に保存します' } });
     });
-    items.push({ type: 'action', action: { type: 'postback', label: '📁 未分類', data: 'action=set_project&batch=' + batchId + '&p=' + encodeURIComponent('未分類') } });
+    items.push({ type: 'action', action: { type: 'postback', label: '🆕 新規プロジェクト作成', data: 'action=new_project&batch=' + batchId } });
     items.push({ type: 'action', action: { type: 'postback', label: '❌ 無視', data: 'action=ignore&batch=' + batchId } });
   }
 
@@ -783,14 +882,25 @@ function handlePostback(ev, userId, groupId) {
       '\n\n修正内容をお送りいただくと再度ご確認いたします。（10分以内）');
 
   } else if (action === 'set_project') {
-    // 案件選択後 → 案件名を仮タスクに適用 → 確認画面へ
+    // 既存プロジェクト選択 → 即保存（候補提示UIで既に選んでもらっているため確認は省略可）
     var projectName = decodeURIComponent(params.p || '未分類');
     var items3      = getPendingItems(batchId);
     if (!items3.length) { sendLineReply(ev.replyToken, '確認データが見つかりませんでした。'); return; }
 
     applyProjectToPending(batchId, projectName);
-    var rebuilt = rebuildExtractedFromPending(items3, projectName);
-    sendConfirmUI(ev.replyToken, rebuilt, projectName, batchId);
+    var refreshed3 = getPendingItems(batchId);
+    var registered3 = commitPendingItems(refreshed3);
+    deletePendingItems(batchId);
+    sendLineReply(ev.replyToken,
+      '✅ 『' + projectName + '』に保存しました。\n\n' + buildRegisteredMsg(registered3));
+
+  } else if (action === 'new_project') {
+    // 新規プロジェクト作成 → 次のメッセージをプロジェクト名として受け取る
+    var itemsNP = getPendingItems(batchId);
+    if (!itemsNP.length) { sendLineReply(ev.replyToken, '確認データが見つかりませんでした。'); return; }
+    setNewProjectMode(userId, batchId);
+    sendLineReply(ev.replyToken,
+      '【新規プロジェクト作成】\n保存先のプロジェクト名を次のメッセージでご入力ください（10分以内、「キャンセル」で中止）。');
 
   } else if (action === 'doc_summary') {
     handleDocSummaryPostback(ev, params);
@@ -1057,6 +1167,64 @@ function clearRetryMode(userId) {
   PropertiesService.getScriptProperties().deleteProperty('RETRY_' + userId);
 }
 
+// 新規プロジェクト名入力モード（10分TTL）
+function setNewProjectMode(userId, batchId) {
+  PropertiesService.getScriptProperties().setProperty(
+    'NEWPROJ_' + userId,
+    JSON.stringify({ batchId: batchId, ts: Date.now() })
+  );
+}
+function getNewProjectMode(userId) {
+  var raw = PropertiesService.getScriptProperties().getProperty('NEWPROJ_' + userId);
+  if (!raw) return null;
+  try {
+    var obj = JSON.parse(raw);
+    if (Date.now() - obj.ts > 10 * 60 * 1000) { clearNewProjectMode(userId); return null; }
+    return obj.batchId;
+  } catch (e) { return null; }
+}
+function clearNewProjectMode(userId) {
+  PropertiesService.getScriptProperties().deleteProperty('NEWPROJ_' + userId);
+}
+
+// 新規プロジェクト名を受け取り、プロジェクト登録＋仮タスク保存をまとめて実行
+function finalizeNewProject(projectName, batchId, groupId, userId, replyToken) {
+  projectName = String(projectName || '').trim();
+
+  // キャンセル系入力で中止
+  if (/^(キャンセル|cancel|中止|やめる)$/i.test(projectName)) {
+    deletePendingItems(batchId);
+    sendLineReply(replyToken, '❌ 新規プロジェクト作成を中止しました。仮タスクも削除しました。');
+    return;
+  }
+  if (!projectName) {
+    setNewProjectMode(userId, batchId);
+    sendLineReply(replyToken, 'プロジェクト名が空です。もう一度ご入力ください。');
+    return;
+  }
+  if (projectName.length > 60) {
+    setNewProjectMode(userId, batchId);
+    sendLineReply(replyToken, 'プロジェクト名が長すぎます（60文字以内）。もう一度ご入力ください。');
+    return;
+  }
+
+  var items = getPendingItems(batchId);
+  if (!items.length) {
+    sendLineReply(replyToken, '⚠️ 確認データが見つかりませんでした（時間切れの可能性があります）。');
+    return;
+  }
+
+  registerNewProject(projectName, groupId);
+  applyProjectToPending(batchId, projectName);
+  var refreshed  = getPendingItems(batchId);
+  var registered = commitPendingItems(refreshed);
+  deletePendingItems(batchId);
+
+  sendLineReply(replyToken,
+    '✅ 新規プロジェクト『' + projectName + '』を作成し、以下を保存しました。\n\n' +
+    buildRegisteredMsg(registered));
+}
+
 function reprocessMessage(text, oldBatchId, groupId, userId, sender, ts, replyToken) {
   deletePendingItems(oldBatchId);
   if (shouldSkipExtraction(text) || !ruleBasedFilter(text)) {
@@ -1068,13 +1236,24 @@ function reprocessMessage(text, oldBatchId, groupId, userId, sender, ts, replyTo
     sendLineReply(replyToken, 'タスク・スケジュールが見つかりませんでした。恐れ入りますが、内容を確認の上もう一度お試しください。');
     return;
   }
-  var proj    = identifyProject(text, groupId, extracted.projectNameHint);
-  var batchId = storePending(extracted, proj.name, groupId, userId, text);
-  if (proj.confidence >= 70) {
-    sendConfirmUI(replyToken, extracted, proj.name, batchId);
-  } else {
-    sendProjectSelectUI(replyToken, extracted, batchId);
+  var boundProject = getProjectNameByGroupId(groupId);
+  if (boundProject) {
+    // グループ紐付け済み → 確認UI（案件は確定として表示）
+    var batchIdB = storePending(extracted, boundProject, groupId, userId, text);
+    sendConfirmUI(replyToken, extracted, boundProject, batchIdB);
+    return;
   }
+  // 未紐付け → 候補+新規作成の選択UIへ
+  var batchId = storePending(extracted, '', groupId, userId, text);
+  var allProjects = getProjectData();
+  if (!allProjects.length) {
+    setNewProjectMode(userId, batchId);
+    sendLineReply(replyToken,
+      '【新規プロジェクト作成】\n保存先のプロジェクト名を次のメッセージでご入力ください（10分以内、「キャンセル」で中止）。');
+    return;
+  }
+  var candidates = getProjectCandidates(text, groupId, extracted.projectNameHint, 4);
+  sendProjectSelectUI(replyToken, extracted, batchId, candidates, groupId, extracted.projectNameHint);
 }
 
 // ==========================================
@@ -2266,6 +2445,55 @@ function testExtractFreeText() {
     console.log('結果:', JSON.stringify({ hint: result.projectNameHint, tasks: result.tasks, schedules: result.schedules }, null, 2));
     console.log('---');
   });
+}
+
+// プロジェクト候補抽出のテスト（LINE送信なし）
+function testProjectCandidates() {
+  var cases = [
+    'WOODBASE LP制作の件で田中さんに連絡します',
+    'WOODBASE LINE秘書Botのバグ対応お願いします',
+    'WOODBASEの保守対応進めます',
+    '雨晴れの件で打ち合わせしよう',
+    '全く関係ない話題のメッセージ',
+  ];
+  cases.forEach(function(text) {
+    var cands = getProjectCandidates(text, 'test-group', '', 5);
+    console.log('入力: "' + text + '"');
+    if (!cands.length) {
+      console.log('  → 候補なし（新規作成プロンプトに進む）');
+    } else {
+      cands.forEach(function(c, i) {
+        console.log('  ' + (i + 1) + '. ' + c.name + ' (信頼度:' + c.confidence + ' / ' + c.reason + ')');
+      });
+    }
+    console.log('---');
+  });
+}
+
+// 新規プロジェクト作成フローのドライラン（シート書き込みあり・LINE送信なし）
+function testNewProjectFlow() {
+  var text    = '新案件の打ち合わせを明日10時から事務所で田中さんとやる';
+  var groupId = 'test-group-newproj';
+  var userId  = 'test-user-newproj';
+
+  var extracted = extractWithGemini(text, groupId, new Date(), '濱田');
+  console.log('抽出:', JSON.stringify({ tasks: extracted.tasks, schedules: extracted.schedules }, null, 2));
+
+  var batchId = storePending(extracted, '', groupId, userId, text);
+  console.log('仮タスク保存 batchId:', batchId);
+
+  // ユーザーが「新規プロジェクト作成」を選んだと仮定
+  setNewProjectMode(userId, batchId);
+  console.log('NEWPROJモード設定 → 取得:', getNewProjectMode(userId));
+
+  // ユーザーが新規名「テスト新規案件」を入力したと仮定
+  // 実環境ではsendLineReply経由なのでここではコメント化:
+  // finalizeNewProject('テスト新規案件', batchId, groupId, userId, null);
+
+  // ドライランのため仮タスクをクリーンアップ
+  clearNewProjectMode(userId);
+  deletePendingItems(batchId);
+  console.log('テスト終了（仮タスクは削除済み）');
 }
 
 // 案件識別→確認フローの統合テスト（シート書き込みあり・LINE送信なし）
