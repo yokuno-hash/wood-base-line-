@@ -11,7 +11,7 @@ var ESTIMATE_LINK_SETTING_SHEET = '見積連携設定';
 var ESTIMATE_RATE_SHEET         = '見積単価設定';
 var ESTIMATE_CONFIRM_SHEET      = '見積要確認';
 
-var ESTIMATE_LINK_HEADERS    = ['設定ID','名称','工程管理表ID','工程シート名','見積書ID','テンプレートシート名','出力シート名形式','担当者表示','有効'];
+var ESTIMATE_LINK_HEADERS    = ['設定ID','表示名','工程管理表ID','工程シート名','見積書ID','テンプレートシート名','担当者表示','単価','有効','備考'];
 var ESTIMATE_RATE_HEADERS    = ['設定ID','分類','条件キーワード','単価','単位','備考'];
 var ESTIMATE_CONFIRM_HEADERS = ['作成日時','設定ID','対象シート名','物件','図面名','分類','理由'];
 
@@ -56,31 +56,127 @@ var TAX_RATE = 0.10;
 // SECTION: 設定シート操作
 // ==========================================
 
+// 「見積連携設定」シートを必要に応じて作成・ヘッダー補完
+function ensureEstimateLinkSettingsSheet() {
+  var ss = getSS();
+  var sh = ss.getSheetByName(ESTIMATE_LINK_SETTING_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(ESTIMATE_LINK_SETTING_SHEET);
+    sh.appendRow(ESTIMATE_LINK_HEADERS);
+    sh.getRange(1, 1, 1, ESTIMATE_LINK_HEADERS.length).setFontWeight('bold').setBackground('#D9EAD3');
+    return sh;
+  }
+  // 既存シート：足りないヘッダーを末尾に追加（既存データを壊さない）
+  var lastCol = sh.getLastColumn();
+  var headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h).trim(); });
+  var aliasMap = { '表示名': ['名称'] };  // 旧名「名称」も同義として扱う
+  ESTIMATE_LINK_HEADERS.forEach(function(h){
+    var alias = aliasMap[h] || [];
+    var exists = headers.indexOf(h) !== -1 || alias.some(function(a){ return headers.indexOf(a) !== -1; });
+    if (!exists) {
+      sh.getRange(1, sh.getLastColumn() + 1).setValue(h);
+      sh.getRange(1, sh.getLastColumn(), 1, 1).setFontWeight('bold').setBackground('#D9EAD3');
+      headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+    }
+  });
+  return sh;
+}
+
 function getEstimateLinkSettings() {
-  var sh = getSheet(ESTIMATE_LINK_SETTING_SHEET);
+  var sh = ensureEstimateLinkSettingsSheet();
   if (!sh || sh.getLastRow() < 2) return [];
   var data = sh.getDataRange().getValues();
   var headers = data[0].map(function(h){ return String(h).trim(); });
-  var idx = {};
-  ESTIMATE_LINK_HEADERS.forEach(function(h){ idx[h] = headers.indexOf(h); });
+
+  function col() {
+    for (var i = 0; i < arguments.length; i++) {
+      var idx = headers.indexOf(arguments[i]);
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  }
+  var iId      = col('設定ID');
+  var iName    = col('表示名', '名称');
+  var iProcSs  = col('工程管理表ID');
+  var iProcSh  = col('工程シート名');
+  var iEstSs   = col('見積書ID');
+  var iTpl     = col('テンプレートシート名');
+  var iAssign  = col('担当者表示');
+  var iPrice   = col('単価');
+  var iEnabled = col('有効');
+  var iNote    = col('備考');
+
   var rows = [];
   for (var i = 1; i < data.length; i++) {
     var r = data[i];
-    if (!r[idx['設定ID']]) continue;
-    var enabled = r[idx['有効']];
+    if (!r[iId]) continue;
+    var enabled = iEnabled !== -1 ? r[iEnabled] : true;
     if (enabled === false || String(enabled).toUpperCase() === 'FALSE') continue;
+    var price = iPrice !== -1 ? Number(r[iPrice]) : NaN;
+    if (!price || isNaN(price)) price = 5000;
+    var name = iName !== -1 ? String(r[iName] || '').trim() : '';
     rows.push({
-      settingId:       String(r[idx['設定ID']]).trim(),
-      name:            String(r[idx['名称']]).trim(),
-      processSsId:     String(r[idx['工程管理表ID']]).trim(),
-      processSheet:    String(r[idx['工程シート名']]).trim(),
-      estimateSsId:    String(r[idx['見積書ID']]).trim(),
-      templateSheet:   String(r[idx['テンプレートシート名']]).trim(),
-      sheetNameFormat: String(r[idx['出力シート名形式']]).trim() || 'YY-M',
-      assigneeLabel:   String(r[idx['担当者表示']]).trim(),
+      settingId:             String(r[iId]).trim(),
+      displayName:           name,
+      processSpreadsheetId:  String(r[iProcSs] || '').trim(),
+      processSheetName:      String(r[iProcSh] || '').trim(),
+      estimateSpreadsheetId: String(r[iEstSs] || '').trim(),
+      templateSheetName:     String(r[iTpl] || '').trim(),
+      assigneeLabel:         iAssign !== -1 ? String(r[iAssign] || '').trim() : '',
+      unitPrice:             price,
+      enabled:               true,
+      note:                  iNote !== -1 ? String(r[iNote] || '').trim() : '',
+      // 後方互換（既存コード参照用エイリアス）
+      name:          name,
+      processSsId:   String(r[iProcSs] || '').trim(),
+      processSheet:  String(r[iProcSh] || '').trim(),
+      estimateSsId:  String(r[iEstSs] || '').trim(),
+      templateSheet: String(r[iTpl] || '').trim(),
     });
   }
   return rows;
+}
+
+// 有効な設定の一覧テキストを返す（「見積設定一覧」コマンド用）
+function listEstimateSettings() {
+  var settings = getEstimateLinkSettings();
+  if (!settings.length) {
+    return '⚠️ 「見積連携設定」シートに有効な設定がありません。';
+  }
+  var lines = ['登録済みの見積設定です。', ''];
+  settings.forEach(function(s){
+    var line = '・' + (s.displayName || '(名称未設定)') + '（' + s.settingId + '）';
+    if (s.note) line += ' — ' + s.note;
+    lines.push(line);
+  });
+  lines.push('', '使い方：', (settings[0].displayName || settings[0].settingId) + ' 5月分の見積書作って');
+  return lines.join('\n');
+}
+
+// 「見積設定一覧」コマンド判定
+function isEstimateSettingsListRequest(text) {
+  if (!text) return false;
+  return /見積設定一覧|見積一覧|見積設定リスト/.test(text);
+}
+
+function handleEstimateSettingsListRequest(event, messageText) {
+  if (!isEstimateSettingsListRequest(messageText)) return false;
+  sendLineReply(event.replyToken, listEstimateSettings());
+  return true;
+}
+
+// 候補一覧テキスト（該当なし／複数候補時に使用）
+function listEstimateSettingCandidates() {
+  var settings = getEstimateLinkSettings();
+  if (!settings.length) {
+    return '⚠️ 「見積連携設定」シートに登録がありません。\n設定を1行追加してから再度お試しください。';
+  }
+  var lines = ['見積書を作成する対象が見つかりませんでした。', '', '登録済みの対象：'];
+  settings.forEach(function(s){
+    lines.push('・' + (s.displayName || '(名称未設定)') + '（' + s.settingId + '）');
+  });
+  lines.push('', '例：「' + (settings[0].displayName || settings[0].settingId) + ' 5月分の見積書作って」のように送ってください。');
+  return lines.join('\n');
 }
 
 function getEstimateRateSettings() {
@@ -117,21 +213,29 @@ function isEstimateCreateRequest(text) {
          (/見積(書)?/.test(text) && /(作って|作成|つくって|お願い)/.test(text));
 }
 
+// メッセージから設定を検索
+//   戻り値: null（該当なし）／ setting オブジェクト1件 ／ setting 配列（複数候補）
 function findEstimateSettingFromMessage(text) {
   if (!text) return null;
   var settings = getEstimateLinkSettings();
   if (!settings.length) return null;
-  // 名称・設定IDの完全/部分一致を順に試す
-  var t = String(text).normalize('NFKC');
-  // 名称優先（長いほうから）
-  var byName = settings.slice().sort(function(a,b){ return b.name.length - a.name.length; });
-  for (var i = 0; i < byName.length; i++) {
-    if (byName[i].name && t.indexOf(byName[i].name) !== -1) return byName[i];
+  var t = String(text).normalize('NFKC').toLowerCase();
+
+  // 表示名・設定IDのいずれかが含まれる設定を抽出
+  var matches = settings.filter(function(s){
+    var name = (s.displayName || '').normalize('NFKC').toLowerCase();
+    var id   = (s.settingId   || '').toLowerCase();
+    return (name && t.indexOf(name) !== -1) || (id && t.indexOf(id) !== -1);
+  });
+
+  if (matches.length === 1) return matches[0];
+  if (matches.length >= 2) {
+    // 表示名長で一意化を試す（より具体的なものを優先）
+    matches.sort(function(a, b){ return (b.displayName || '').length - (a.displayName || '').length; });
+    if (matches[0].displayName.length > matches[1].displayName.length) return matches[0];
+    return matches;
   }
-  for (var j = 0; j < settings.length; j++) {
-    if (settings[j].settingId && t.toLowerCase().indexOf(settings[j].settingId.toLowerCase()) !== -1) return settings[j];
-  }
-  // 1件しか登録されていなければそれを使う
+  // 0件で登録が1件しかなければそれを使う
   if (settings.length === 1) return settings[0];
   return null;
 }
@@ -281,13 +385,15 @@ function getEstimateRate(settingId, category, drawingName, rateSettings) {
 // SECTION: 集計計算
 // ==========================================
 
-// 計算ルール（東邦家具・統一版）：
-//   金額 = 製図時間 × HOURLY_RATE（新規・修正とも共通）
-//   修正: 数量=製図時間 / 単位=H / 単価=HOURLY_RATE / 金額=製図時間×HOURLY_RATE
-//   新規: 数量=枚数      / 単位=枚 / 単価=空欄        / 金額=製図時間×HOURLY_RATE
-var HOURLY_RATE = 5000;
+// 計算ルール（共通版）：
+//   金額 = 製図時間 × setting.unitPrice（新規・修正とも共通）
+//   修正: 数量=製図時間 / 単位=H / 単価=unitPrice / 金額=製図時間×unitPrice
+//   新規: 数量=枚数      / 単位=枚 / 単価=空欄    / 金額=製図時間×unitPrice
+var HOURLY_RATE = 5000; // フォールバックデフォルト
 
-function calculateEstimateData(groups, rateSettings, settingId) {
+function calculateEstimateData(groups, setting) {
+  var hourlyRate = (setting && setting.unitPrice) || HOURLY_RATE;
+  var settingId  = setting && setting.settingId;
   var properties   = [];
   var confirmItems = [];
   var subtotal     = 0;
@@ -313,8 +419,9 @@ function calculateEstimateData(groups, rateSettings, settingId) {
           detail.name      = (r.drawingName || '') + ' 修正';
           detail.qty       = r.time;
           detail.unit      = 'H';
-          detail.unitPrice = HOURLY_RATE;
-          detail.amount    = r.time * HOURLY_RATE;
+          // 時間が1Hのときは単価欄を表示しない（数量=金額になるため重複表示を避ける）
+          detail.unitPrice = r.time === 1 ? '' : hourlyRate;
+          detail.amount    = r.time * hourlyRate;
           fixHours += r.time;
         }
       } else if (r.category === '新規') {
@@ -328,7 +435,7 @@ function calculateEstimateData(groups, rateSettings, settingId) {
           detail.qty       = r.count || '';
           detail.unit      = '枚';
           detail.unitPrice = ''; // 新規は単価欄空欄（仕様）
-          detail.amount    = r.time * HOURLY_RATE;
+          detail.amount    = r.time * hourlyRate;
           newSheets += r.count || 0;
         }
       } else if (r.category === '検討のみ' || r.category === 'WBF') {
@@ -497,64 +604,118 @@ function writeEstimateConfirmItems(confirmItems, targetSheetName) {
 // SECTION: メイン処理
 // ==========================================
 
+// 設定 + 年月から見積書を作成する共通処理（LINE非依存）
+//   戻り値: { kind: 'success'|'exists'|'noData', sheetName, spreadsheetUrl, data, year, month, setting }
+function createEstimateFromProcessSheet(setting, year, month) {
+  // 必須フィールド検証
+  var missing = [];
+  if (!setting.processSpreadsheetId)  missing.push('工程管理表ID');
+  if (!setting.processSheetName)      missing.push('工程シート名');
+  if (!setting.estimateSpreadsheetId) missing.push('見積書ID');
+  if (!setting.templateSheetName)     missing.push('テンプレートシート名');
+  if (missing.length) {
+    return { kind: 'configError', setting: setting, missing: missing };
+  }
+
+  var sheetName = buildEstimateSheetName(year, month);
+
+  // 既存チェック（上書き禁止）
+  var preCheckSs;
+  try {
+    preCheckSs = SpreadsheetApp.openById(setting.estimateSpreadsheetId);
+  } catch (e) {
+    return { kind: 'openError', setting: setting, target: '見積書', id: setting.estimateSpreadsheetId, message: e.message };
+  }
+  if (preCheckSs.getSheetByName(sheetName)) {
+    return { kind: 'exists', sheetName: sheetName, spreadsheetUrl: preCheckSs.getUrl(), setting: setting };
+  }
+
+  var processData;
+  try {
+    processData = getProcessRowsBySetting(setting);
+  } catch (e) {
+    return { kind: 'openError', setting: setting, target: '工程管理表', id: setting.processSpreadsheetId, message: e.message };
+  }
+  var allRows     = normalizeProcessRows(processData);
+  var targetRows  = filterRowsByTargetMonth(allRows, year, month);
+  if (!targetRows.length) {
+    return { kind: 'noData', sheetName: sheetName, year: year, month: month, setting: setting };
+  }
+
+  var groups = groupRowsByProperty(targetRows);
+  var data   = calculateEstimateData(groups, setting);
+
+  var copyRes = copyEstimateTemplateSheet(setting.estimateSpreadsheetId, setting.templateSheetName, sheetName);
+  var target  = copyRes.sheet;
+
+  writeEstimateCover(target, data, setting);
+  writeEstimateDetails(target, data, setting);
+  writeEstimateTotals(target, data);
+  writeEstimateConfirmItems(data.confirmItems, sheetName);
+
+  return {
+    kind:           'success',
+    sheetName:      sheetName,
+    spreadsheetUrl: copyRes.ss.getUrl(),
+    data:           data,
+    year:           year,
+    month:          month,
+    setting:        setting,
+  };
+}
+
 function handleEstimateCreateRequest(event, messageText) {
   try {
     if (!isEstimateCreateRequest(messageText)) return false;
 
-    var setting = findEstimateSettingFromMessage(messageText);
-    if (!setting) {
-      sendLineReply(event.replyToken, '⚠️ 対象の見積設定が特定できませんでした。\n「見積連携設定」シートの名称をメッセージに含めてください。');
+    // 設定特定
+    var matched = findEstimateSettingFromMessage(messageText);
+    if (!matched) {
+      sendLineReply(event.replyToken, listEstimateSettingCandidates());
       return true;
     }
+    if (Array.isArray(matched)) {
+      var lines = ['対象が複数該当しました。明示してもう一度送信してください。', ''];
+      matched.forEach(function(s){ lines.push('・' + s.displayName + '（' + s.settingId + '）'); });
+      lines.push('', '例：「' + matched[0].settingId + ' 5月分の見積書作って」');
+      sendLineReply(event.replyToken, lines.join('\n'));
+      return true;
+    }
+    var setting = matched;
 
+    // 対象年月
     var ym = parseEstimateTargetDate(messageText);
     if (!ym) {
       sendLineReply(event.replyToken, '⚠️ 対象年月が読み取れませんでした。「5月分」「2026年5月」のように指定してください。');
       return true;
     }
 
-    var sheetName = buildEstimateSheetName(ym.year, ym.month);
-
-    // 既存チェック
-    var preCheckSs = SpreadsheetApp.openById(setting.estimateSsId);
-    if (preCheckSs.getSheetByName(sheetName)) {
-      sendLineReply(event.replyToken, '⚠️ 既に「' + sheetName + '」が存在します。\n上書きしないため処理を中止しました。\n\n見積書：' + preCheckSs.getUrl());
+    var result = createEstimateFromProcessSheet(setting, ym.year, ym.month);
+    if (result.kind === 'configError') {
+      sendLineReply(event.replyToken, '⚠️ 設定「' + setting.displayName + '（' + setting.settingId + '）」に必須項目が未設定です：\n・' + result.missing.join('\n・') + '\n\n「見積連携設定」シートを確認してください。');
       return true;
     }
-
-    // 工程データ取得 → 抽出
-    var processData = getProcessRowsBySetting(setting);
-    var allRows     = normalizeProcessRows(processData);
-    var targetRows  = filterRowsByTargetMonth(allRows, ym.year, ym.month);
-    if (!targetRows.length) {
-      sendLineReply(event.replyToken, '⚠️ 工程管理表に「' + ym.year + '年' + ym.month + '月」のデータがありませんでした。');
+    if (result.kind === 'openError') {
+      sendLineReply(event.replyToken, '⚠️ ' + result.target + 'を開けませんでした。\nID：' + result.id + '\n権限・IDが正しいか確認してください。\n\n詳細：' + result.message);
       return true;
     }
-
-    var groups       = groupRowsByProperty(targetRows);
-    var rateSettings = getEstimateRateSettings();
-    var data         = calculateEstimateData(groups, rateSettings, setting.settingId);
-
-    // テンプレコピー
-    var copyRes = copyEstimateTemplateSheet(setting.estimateSsId, setting.templateSheet, sheetName);
-    var target  = copyRes.sheet;
-
-    // 反映
-    writeEstimateCover(target, data, setting);
-    writeEstimateDetails(target, data, setting);
-    writeEstimateTotals(target, data);
-    writeEstimateConfirmItems(data.confirmItems, sheetName);
-
-    var reply = formatEstimateCreatedReply({
-      setting: setting, year: ym.year, month: ym.month, sheetName: sheetName,
-      data: data, spreadsheetUrl: copyRes.ss.getUrl(),
-    });
-    sendLineReply(event.replyToken, reply);
+    if (result.kind === 'exists') {
+      sendLineReply(event.replyToken, '⚠️ 既に「' + result.sheetName + '」の見積書シートがあります。\n上書きしないため処理を中止しました。\n\n見積書：' + result.spreadsheetUrl);
+      return true;
+    }
+    if (result.kind === 'noData') {
+      sendLineReply(event.replyToken, '⚠️ 工程管理表に「' + result.year + '年' + result.month + '月」のデータがありませんでした。');
+      return true;
+    }
+    sendLineReply(event.replyToken, formatEstimateCreatedReply({
+      setting: setting, year: ym.year, month: ym.month, sheetName: result.sheetName,
+      data: result.data, spreadsheetUrl: result.spreadsheetUrl,
+    }));
     return true;
   } catch (err) {
     console.error('handleEstimateCreateRequest error:', err.message, err.stack);
     try { sendLineReply(event.replyToken, '⚠️ 見積書作成中にエラーが発生しました：' + err.message); } catch (e) {}
-    return true; // 他のハンドラに流さない
+    return true;
   }
 }
 
@@ -675,26 +836,75 @@ function listProcessSheetsForToho() {
   ss.getSheets().forEach(function(sh){ console.log(' -', JSON.stringify(sh.getName())); });
 }
 
-// 既存の toho 行を正しいIDで上書き（IDが短かった等の修正用）
+// 現在の DETAIL_START_ROW 等の値を確認（GAS側のコードが最新か確認用）
+function showEstimateConstants() {
+  console.log('DETAIL_START_ROW:',       DETAIL_START_ROW);
+  console.log('DETAIL_PAGE2_END_ROW:',   DETAIL_PAGE2_END_ROW);
+  console.log('DETAIL_PAGE3_START_ROW:', DETAIL_PAGE3_START_ROW);
+  console.log('DETAIL_PAGE3_END_ROW:',   DETAIL_PAGE3_END_ROW);
+  console.log('COVER_ITEM_START_ROW:',   COVER_ITEM_START_ROW);
+  console.log('HOURLY_RATE:',            HOURLY_RATE);
+}
+
+// 既存の toho 行を正しい値で上書き（ヘッダー名ベース・列順非依存）
 function fixTohoEstimateIds() {
-  setupEstimateSheets();
-  var sh = getSheet(ESTIMATE_LINK_SETTING_SHEET);
+  var sh = ensureEstimateLinkSettingsSheet();
   var data = sh.getDataRange().getValues();
-  var processId  = '1coS4GtIZeeqIZYVGdSHpLUKW4ewyINE2KcIG3AV4q5g';
-  var estimateId = '1bwngYD3yaI1gyqdbENYR6BizpworX0_eEA7Bxq0fajY';
-  var templateName = '原図';
+  var headers = data[0].map(function(h){ return String(h).trim(); });
+
+  function colNum(name, alias) {
+    var i = headers.indexOf(name);
+    if (i === -1 && alias) i = headers.indexOf(alias);
+    return i === -1 ? -1 : (i + 1);
+  }
+  var cId       = colNum('設定ID');
+  var cName     = colNum('表示名', '名称');
+  var cProcSs   = colNum('工程管理表ID');
+  var cProcSh   = colNum('工程シート名');
+  var cEstSs    = colNum('見積書ID');
+  var cTpl      = colNum('テンプレートシート名');
+  var cAssign   = colNum('担当者表示');
+  var cPrice    = colNum('単価');
+  var cEnabled  = colNum('有効');
+  var cNote     = colNum('備考');
+
+  var v = {
+    settingId:'toho', name:'東邦家具',
+    processSs:'1coS4GtIZeeqIZYVGdSHpLUKW4ewyINE2KcIG3AV4q5g', processSh:'工程管理表',
+    estSs:'1bwngYD3yaI1gyqdbENYR6BizpworX0_eEA7Bxq0fajY', tpl:'原図',
+    assign:'担当者：米田様', price:5000, enabled:true, note:'東邦家具用'
+  };
+
+  // 既存行を探す
   for (var i = 1; i < data.length; i++) {
-    if (String(data[i][0]).trim() === 'toho') {
-      sh.getRange(i + 1, 3).setValue(processId);
-      sh.getRange(i + 1, 5).setValue(estimateId);
-      sh.getRange(i + 1, 6).setValue(templateName);
-      console.log('toho 行を更新:', '工程=' + processId, '見積=' + estimateId, 'テンプレ=' + templateName);
+    if (cId !== -1 && String(data[i][cId - 1]).trim() === 'toho') {
+      if (cName    !== -1) sh.getRange(i + 1, cName).setValue(v.name);
+      if (cProcSs  !== -1) sh.getRange(i + 1, cProcSs).setValue(v.processSs);
+      if (cProcSh  !== -1) sh.getRange(i + 1, cProcSh).setValue(v.processSh);
+      if (cEstSs   !== -1) sh.getRange(i + 1, cEstSs).setValue(v.estSs);
+      if (cTpl     !== -1) sh.getRange(i + 1, cTpl).setValue(v.tpl);
+      if (cAssign  !== -1) sh.getRange(i + 1, cAssign).setValue(v.assign);
+      if (cPrice   !== -1) sh.getRange(i + 1, cPrice).setValue(v.price);
+      if (cEnabled !== -1) sh.getRange(i + 1, cEnabled).setValue(v.enabled);
+      if (cNote    !== -1 && !data[i][cNote - 1]) sh.getRange(i + 1, cNote).setValue(v.note);
+      console.log('toho 行を更新（ヘッダー名ベース）');
       return;
     }
   }
-  // tohoが無ければ追加
-  sh.appendRow(['toho', '東邦家具', processId, '工程管理表', estimateId, templateName, 'YY-M', '担当者：米田様', true]);
-  console.log('toho 行を追加');
+  // 新規追加
+  var row = new Array(headers.length).fill('');
+  if (cId      !== -1) row[cId - 1] = v.settingId;
+  if (cName    !== -1) row[cName - 1] = v.name;
+  if (cProcSs  !== -1) row[cProcSs - 1] = v.processSs;
+  if (cProcSh  !== -1) row[cProcSh - 1] = v.processSh;
+  if (cEstSs   !== -1) row[cEstSs - 1] = v.estSs;
+  if (cTpl     !== -1) row[cTpl - 1] = v.tpl;
+  if (cAssign  !== -1) row[cAssign - 1] = v.assign;
+  if (cPrice   !== -1) row[cPrice - 1] = v.price;
+  if (cEnabled !== -1) row[cEnabled - 1] = v.enabled;
+  if (cNote    !== -1) row[cNote - 1] = v.note;
+  sh.appendRow(row);
+  console.log('toho 行を追加（ヘッダー名ベース）');
 }
 
 // テンプレートシートの構造を確認（セル位置調整のため）

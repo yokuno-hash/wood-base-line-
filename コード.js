@@ -109,6 +109,8 @@ function handleDM(ev, userId, groupId, sender, text, ts) {
     sendLineReply(ev.replyToken, 'WOODBASE秘書AIにご登録いただきました。\nタスクが割り当てられた際にはお知らせいたします。\n\n「残タスクは？」「今週の予定は？」とお送りいただくとご確認いただけます。');
     return;
   }
+  // 見積設定一覧コマンド
+  if (handleEstimateSettingsListRequest(ev, text)) return;
   // 見積書作成リクエスト（進捗質問より先に処理）
   if (handleEstimateCreateRequest(ev, text)) return;
   // 進捗管理表への自然文クエリ（完了報告誤判定より先に処理）
