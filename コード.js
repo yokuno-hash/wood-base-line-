@@ -109,6 +109,8 @@ function handleDM(ev, userId, groupId, sender, text, ts) {
     sendLineReply(ev.replyToken, 'WOODBASE秘書AIにご登録いただきました。\nタスクが割り当てられた際にはお知らせいたします。\n\n「残タスクは？」「今週の予定は？」とお送りいただくとご確認いただけます。');
     return;
   }
+  // 見積書作成リクエスト（進捗質問より先に処理）
+  if (handleEstimateCreateRequest(ev, text)) return;
   // 進捗管理表への自然文クエリ（完了報告誤判定より先に処理）
   if (handleProgressQuestionRequest(ev, text)) return;
   if (isCompletionReport(text)) { handleCompletion(text, sender, ev.replyToken); return; }
@@ -127,14 +129,22 @@ function handleGroup(ev, groupId, userId, sender, text, ts) {
   var mention      = ev.message.mention;
   var botMentioned = isBotMentioned(mention);
 
-  // @WBG メンション → コマンド処理（グループに返信あり）
+  // テキストプレフィックスでもメンション扱い（PC版LINEで@候補が出ない場合の回避策）
+  // 「@WBG」「＠WBG」「/WBG」「/wbg」「秘書:」「秘書：」を文頭に書けば反応
+  var textPrefixMatch = text && text.match(/^\s*(@WBG|＠WBG|\/WBG|\/wbg|秘書[:：])\s*/i);
+  if (textPrefixMatch) {
+    botMentioned = true;
+    // プレフィックス部分を除去して後続処理に渡す（既存のテキスト解析を壊さないため）
+    ev.message.text = text.slice(textPrefixMatch[0].length);
+    text = ev.message.text;
+  }
+
   if (botMentioned) {
     handleMentionCommand(ev, groupId, userId, sender, text, ts);
     return;
   }
 
   // 通常メッセージ → グループには何も返さない（サイレント）
-  // メッセージログへの保存はdoPost側で実施済み
 }
 
 // Bot宛メンション時のコマンド処理（グループへの返信あり）
@@ -149,6 +159,8 @@ function handleMentionCommand(ev, groupId, userId, sender, text, ts) {
     sendLineReply(ev.replyToken, '【会話まとめ】\n' + summarizeChat(groupId));
     return;
   }
+  // ② 見積書作成リクエスト（進捗質問より先に処理）
+  if (handleEstimateCreateRequest(ev, text)) return;
   // ③ 進捗管理表への自然文クエリ（完了報告誤判定より先に処理）
   if (handleProgressQuestionRequest(ev, text)) return;
   // ④ 完了報告
