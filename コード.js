@@ -111,6 +111,8 @@ function handleDM(ev, userId, groupId, sender, text, ts) {
   }
   if (isCompletionReport(text)) { handleCompletion(text, sender, ev.replyToken); return; }
   if (isSummaryRequest(text)) { sendLineReply(ev.replyToken, '【会話まとめ】\n' + summarizeChat(userId)); return; }
+  // 進捗管理表への自然文クエリ
+  if (handleProgressQuestionRequest(ev, text)) return;
   sendLineReply(ev.replyToken, answerQueryForMember(text, sender));
 }
 
@@ -157,7 +159,9 @@ function handleMentionCommand(ev, groupId, userId, sender, text, ts) {
     handlePendingList(ev.replyToken, groupId);
     return;
   }
-  // ④-b タスク・スケジュール照会
+  // ④-b 進捗管理表への自然文クエリ（タスク照会より先に判定）
+  if (handleProgressQuestionRequest(ev, text)) return;
+  // ④-c タスク・スケジュール照会
   if (isQuery(text)) {
     sendLineReply(ev.replyToken, answerQuery(text));
     return;
