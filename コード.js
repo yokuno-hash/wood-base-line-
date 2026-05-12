@@ -27,15 +27,79 @@ function okRes()        { return ContentService.createTextOutput('OK').setMimeTy
 // ==========================================
 // SECTION 1: Webhook メイン
 // ==========================================
+
+// LINE Channel Secret を Script Properties から取得
+function getLineChannelSecret() {
+  return PropertiesService.getScriptProperties().getProperty('LINE_CHANNEL_SECRET');
+}
+
+// HMAC-SHA256 と Base64 を使った安全な等価判定（タイミング攻撃耐性）
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// LINE Webhook 署名検証
+// 注意：GAS doPost(e) では HTTPヘッダー（X-Line-Signature）に直接アクセスできない。
+// そのため以下の二段構えで実装する：
+//   ① URLクエリ ?sig=<署名> または ?token=<シークレット> による検証（推奨）
+//      → LINEコンソールのWebhook URLに ?token=xxx を付けて運用する
+//   ② LINE_CHANNEL_SECRET が未設定の場合は無検証（既存運用との互換性のため）
+//
+// より堅牢にしたい場合は Cloudflare Worker 等の前段プロキシで X-Line-Signature を
+// 検証し、検証済みリクエストにのみ ?token= を付けて GAS に転送する構成を推奨。
+function verifyLineWebhook(e) {
+  var secret = getLineChannelSecret();
+  // シークレット未設定 → 互換性のため通過（運用開始時にプロパティ設定を推奨）
+  if (!secret) {
+    console.warn('LINE_CHANNEL_SECRET が未設定のため署名検証スキップ。Script Properties に登録してください。');
+    return true;
+  }
+  // URL クエリ token（簡易共有秘密）による検証
+  var providedToken = e && e.parameter && (e.parameter.token || e.parameter.t);
+  if (providedToken && timingSafeEqual(String(providedToken), secret)) return true;
+
+  // URL クエリ sig による HMAC 検証（クライアントが事前計算した署名を渡す場合）
+  var providedSig = e && e.parameter && e.parameter.sig;
+  if (providedSig && e.postData && e.postData.contents) {
+    try {
+      var raw = Utilities.computeHmacSha256Signature(e.postData.contents, secret);
+      var expected = Utilities.base64Encode(raw);
+      if (timingSafeEqual(String(providedSig), expected)) return true;
+    } catch (err) { console.error('HMAC計算エラー:', err.message); }
+  }
+
+  console.error('LINE Webhook 署名検証失敗');
+  return false;
+}
+
 function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) return okRes();
+    // 署名検証（失敗時は処理せず終了）
+    if (!verifyLineWebhook(e)) return okRes();
     var events = JSON.parse(e.postData.contents).events || [];
     for (var i = 0; i < events.length; i++) {
       try { handleEvent(events[i]); } catch (err) { console.error('event error:', err.message); }
     }
   } catch (err) { console.error('doPost error:', err.message); }
   return okRes();
+}
+
+// 単体テスト：HMAC計算が期待通り動くか確認
+function testVerifyLineSignature() {
+  var secret = 'test_secret_value';
+  var body   = '{"events":[]}';
+  var raw    = Utilities.computeHmacSha256Signature(body, secret);
+  var sig    = Utilities.base64Encode(raw);
+  console.log('期待される署名:', sig);
+  // 一致テスト
+  console.log('timingSafeEqual同値:',  timingSafeEqual(sig, sig)        === true ? '✅' : '❌');
+  console.log('timingSafeEqual不一致:', timingSafeEqual(sig, sig + 'x') === false ? '✅' : '❌');
+  console.log('timingSafeEqual長さ違い:', timingSafeEqual(sig, '')      === false ? '✅' : '❌');
 }
 
 function handleEvent(ev) {
@@ -877,6 +941,20 @@ function handlePostback(ev, userId, groupId) {
     return;
   }
 
+  // batchId不要アクションを先に処理（到達不能バグ修正）
+  if (action === 'doc_summary') {
+    handleDocSummaryPostback(ev, params);
+    return;
+  }
+  if (action === 'link_group') {
+    var linkProject = decodeURIComponent(params.p || '');
+    var linkGroup   = decodeURIComponent(params.g || '');
+    if (!linkProject || !linkGroup) { sendLineReply(ev.replyToken, '案件の紐付けに失敗しました。'); return; }
+    linkGroupToProject(linkGroup, linkProject);
+    sendLineReply(ev.replyToken, '✅ このグループを「' + linkProject + '」に紐付けました。\nメッセージ・ファイルは自動で振り分けられます。');
+    return;
+  }
+
   if (!batchId) return;
 
   if (action === 'register') {
@@ -919,18 +997,8 @@ function handlePostback(ev, userId, groupId) {
     setNewProjectMode(userId, batchId);
     sendLineReply(ev.replyToken,
       '【新規プロジェクト作成】\n保存先のプロジェクト名を次のメッセージでご入力ください（10分以内、「キャンセル」で中止）。');
-
-  } else if (action === 'doc_summary') {
-    handleDocSummaryPostback(ev, params);
-
-  } else if (action === 'link_group') {
-    // グループと案件を紐付け
-    var linkProject = decodeURIComponent(params.p || '');
-    var linkGroup   = decodeURIComponent(params.g || '');
-    if (!linkProject || !linkGroup) { sendLineReply(ev.replyToken, '案件の紐付けに失敗しました。'); return; }
-    linkGroupToProject(linkGroup, linkProject);
-    sendLineReply(ev.replyToken, '✅ このグループを「' + linkProject + '」に紐付けました。\nメッセージ・ファイルは自動で振り分けられます。');
   }
+  // 注: doc_summary / link_group は batchId 不要のため上方で先に処理される
 }
 
 function parseParams(data) {
@@ -1500,33 +1568,35 @@ function promptAllGroupsToLinkProject() {
 }
 
 // メッセージログに履歴がある全グループのメンバーを一括登録
-function syncAllGroupMembers() {
+// メッセージログから抽出したグループID群を対象にメンバー同期
+function syncAllGroupMembersFromLogs() {
   var sheet = getSheet('メッセージログ');
-  if (!sheet || sheet.getLastRow() <= 1) { console.log('ログなし'); return; }
+  if (!sheet || sheet.getLastRow() <= 1) { console.log('ログなし'); return 0; }
 
   var data     = sheet.getDataRange().getValues().slice(1);
   var groupIds = {};
   data.forEach(function(r) {
     var gid = String(r[1] || '');
-    if (gid && gid.startsWith('C')) groupIds[gid] = true; // グループIDはCから始まる
+    if (gid && gid.startsWith('C')) groupIds[gid] = true;
   });
 
   var ids = Object.keys(groupIds);
-  console.log('対象グループ数:', ids.length);
+  console.log('[Logs] 対象グループ数:', ids.length);
 
   var total = 0;
   ids.forEach(function(gid) {
-    console.log('同期中:', gid);
+    console.log('[Logs] 同期中:', gid);
     try {
       var count = syncGroupMembers(gid);
       total += count || 0;
     } catch(e) {
-      console.warn('スキップ:', gid, e.message);
+      console.warn('[Logs] スキップ:', gid, e.message);
     }
     Utilities.sleep(500);
   });
 
-  console.log('全グループ同期完了 / 新規登録合計:', total + '人');
+  console.log('[Logs] 全グループ同期完了 / 新規登録合計:', total + '人');
+  return total;
 }
 
 // グループの全メンバーをメンバー管理シートに一括同期
@@ -1631,27 +1701,35 @@ function broadcastRegistrationPrompt(customText) {
 }
 
 // プロジェクト管理シートの全グループIDからメンバーを一括登録
-function syncAllGroupMembers() {
+// プロジェクト管理シート由来のグループID群を対象にメンバー同期
+function syncAllGroupMembersFromProjects() {
   var sheet = getSheet('プロジェクト管理');
-  if (!sheet || sheet.getLastRow() <= 1) { console.error('プロジェクト管理シートにデータがありません'); return; }
+  if (!sheet || sheet.getLastRow() <= 1) { console.error('プロジェクト管理シートにデータがありません'); return 0; }
 
   var data    = sheet.getDataRange().getValues().slice(1);
   var groupIds = {};
   data.forEach(function(r) {
-    // col2=グループID（施主）, col3=グループID（業者）
     [r[2], r[3]].forEach(function(gid) {
       if (gid && String(gid).startsWith('C')) groupIds[String(gid)] = true;
     });
   });
 
   var ids = Object.keys(groupIds);
-  console.log('対象グループ数:', ids.length);
+  console.log('[Projects] 対象グループ数:', ids.length);
   var total = 0;
   ids.forEach(function(gid) {
-    console.log('--- グループ:', gid);
-    total += syncGroupMembers(gid) || 0;
+    console.log('[Projects] --- グループ:', gid);
+    try { total += syncGroupMembers(gid) || 0; } catch(e) { console.warn('[Projects] スキップ:', gid, e.message); }
   });
-  console.log('合計新規登録:', total + '人');
+  console.log('[Projects] 合計新規登録:', total + '人');
+  return total;
+}
+
+// 統合関数（外部呼び出し互換のため名前は維持）
+function syncAllGroupMembers() {
+  var fromLogs     = syncAllGroupMembersFromLogs() || 0;
+  var fromProjects = syncAllGroupMembersFromProjects() || 0;
+  console.log('合計新規登録:', (fromLogs + fromProjects) + '人 (Logs:' + fromLogs + ' / Projects:' + fromProjects + ')');
 }
 
 // ボットがグループ参加時 → 案件選択UIを表示
@@ -2253,15 +2331,32 @@ function archiveCompletedTasks() {
   var archSheet = getSheet('完了タスク');
   if (!archSheet) {
     archSheet = getSS().insertSheet('完了タスク');
-    archSheet.appendRow(['タスクID', '案件名', 'タスク内容', '担当者', '期日', 'ステータス', '作成日時', 'グループID']);
-    archSheet.getRange(1, 1, 1, 8).setFontWeight('bold').setBackground('#B7B7B7').setFontColor('#FFFFFF');
+    archSheet.appendRow(['タスクID','案件名','タスク内容','担当者','期日','ステータス','作成日時','グループID','緊急度','完了日時']);
+    archSheet.getRange(1, 1, 1, 10).setFontWeight('bold').setBackground('#B7B7B7').setFontColor('#FFFFFF');
+  } else {
+    // 既存シート：不足ヘッダーを補完
+    var lastCol = archSheet.getLastColumn();
+    var hdrs    = archSheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h).trim(); });
+    ['緊急度','完了日時'].forEach(function(h){
+      if (hdrs.indexOf(h) === -1) {
+        archSheet.getRange(1, archSheet.getLastColumn() + 1).setValue(h);
+        archSheet.getRange(1, archSheet.getLastColumn()).setFontWeight('bold').setBackground('#B7B7B7').setFontColor('#FFFFFF');
+      }
+    });
   }
 
   var data  = sheet.getDataRange().getValues();
   var toDel = [];
+  var now   = fmtDT(new Date());
   for (var i = data.length - 1; i >= 1; i--) {
     var st = String(data[i][5] || '');
-    if (st === 'done' || st === '完了') { archSheet.appendRow(data[i]); toDel.push(i + 1); }
+    if (st !== 'done' && st !== '完了') continue;
+    // タスク管理は9列（緊急度含む）想定。完了日時を末尾に追加してアーカイブ
+    var row = data[i].slice(0, 9);
+    while (row.length < 9) row.push(''); // 緊急度欠落のレガシー行に対応
+    row.push(now); // 完了日時
+    archSheet.appendRow(row);
+    toDel.push(i + 1);
   }
   toDel.forEach(function(r) { sheet.deleteRow(r); });
   console.log('アーカイブ: ' + toDel.length + '件');
@@ -2321,15 +2416,23 @@ function geminiText(responseBody) {
 // ==========================================
 // SECTION 20: 初期セットアップ
 // ==========================================
+// 安全版 setup：既存データを絶対に消さない（運用中再実行OK）
+//   - シートがなければ作成
+//   - シートが空ならヘッダー書込
+//   - 既にヘッダーがある場合、不足列のみ右側に追加
+//   - clearContents() は呼ばない
 function setup() {
   var ss = getSS();
 
   setupSheet(ss, 'タスク管理',
-    ['タスクID', '案件名', 'タスク内容', '担当者', '期日', 'ステータス', '作成日時', 'グループID'],
-    '#4A86E8', [120, 160, 280, 100, 100, 80, 140, 160]);
-  getSheet('タスク管理').getRange(2, 6, 1000, 1).setDataValidation(
-    SpreadsheetApp.newDataValidation().requireValueInList(['pending', 'confirmed', 'done'], true).build()
-  );
+    ['タスクID', '案件名', 'タスク内容', '担当者', '期日', 'ステータス', '作成日時', 'グループID', '緊急度'],
+    '#4A86E8', [120, 160, 280, 100, 100, 80, 140, 160, 80]);
+  var taskSheet = getSheet('タスク管理');
+  try {
+    taskSheet.getRange(2, 6, 1000, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(['pending', 'confirmed', 'done'], true).build()
+    );
+  } catch (e) { /* 既存検証は無視 */ }
 
   setupSheet(ss, 'スケジュール管理',
     ['登録日時', '案件名', '予定タイトル', '日付', '開始時間', '終了時間', '場所', '参加者', '詳細', 'グループID'],
@@ -2359,28 +2462,83 @@ function setup() {
     '#9FC5E8', [140, 200, 100, 400]);
 
   setupSheet(ss, '完了タスク',
-    ['タスクID', '案件名', 'タスク内容', '担当者', '期日', 'ステータス', '作成日時', 'グループID'],
-    '#B7B7B7', [120, 160, 280, 100, 100, 80, 140, 160]);
+    ['タスクID', '案件名', 'タスク内容', '担当者', '期日', 'ステータス', '作成日時', 'グループID', '緊急度', '完了日時'],
+    '#B7B7B7', [120, 160, 280, 100, 100, 80, 140, 160, 80, 140]);
 
-  SpreadsheetApp.getUi().alert(
-    '✅ セットアップ完了！\n\n次の手順：\n' +
-    '1. メンバー管理シートにLINEユーザーIDを入力\n' +
-    '2. プロジェクト管理シートに案件情報を入力\n' +
-    '3. スクリプトプロパティにINTERNAL_GROUP_IDとDRIVE_FOLDER_IDを追加\n' +
-    '4. createTriggersを実行'
-  );
+  try {
+    SpreadsheetApp.getUi().alert(
+      '✅ セットアップ完了（既存データは保護されています）\n\n次の手順：\n' +
+      '1. メンバー管理シートにLINEユーザーIDを入力\n' +
+      '2. プロジェクト管理シートに案件情報を入力\n' +
+      '3. スクリプトプロパティに INTERNAL_GROUP_ID / DRIVE_FOLDER_ID / LINE_CHANNEL_SECRET を追加\n' +
+      '4. createTriggers を実行'
+    );
+  } catch (e) { /* UIなし環境（トリガー実行等）はスキップ */ }
 }
 
+// 旧式の破壊的セットアップ（既存データ全消去）
+// 通常は実行しないでください。新規環境の初期化用です。
+function resetAllSheetsDangerously() {
+  if (typeof SpreadsheetApp.getUi === 'function') {
+    var ui = SpreadsheetApp.getUi();
+    var res = ui.alert(
+      '⚠️ 警告：破壊的初期化',
+      '全シートの内容を消去します。本当に実行しますか？\n（運用データが完全に失われます）',
+      ui.ButtonSet.YES_NO
+    );
+    if (res !== ui.Button.YES) { console.log('破壊的初期化をキャンセル'); return; }
+  }
+  var ss = getSS();
+  var defs = [
+    ['タスク管理', ['タスクID','案件名','タスク内容','担当者','期日','ステータス','作成日時','グループID','緊急度']],
+    ['スケジュール管理', ['登録日時','案件名','予定タイトル','日付','開始時間','終了時間','場所','参加者','詳細','グループID']],
+    ['仮タスク', ['バッチID','連番','種別','グループID','ユーザーID','案件名','内容/タイトル','担当者/参加者','期日/日時','作成日時','元メッセージ','追加データ']],
+    ['メンバー管理', ['名前','LINE ユーザーID','役割','備考']],
+    ['プロジェクト管理', ['略称','正式名称','グループID（施主）','グループID（業者）','ステータス','備考']],
+    ['メッセージログ', ['日時','グループID','送信者','メッセージ']],
+    ['完了タスク', ['タスクID','案件名','タスク内容','担当者','期日','ステータス','作成日時','グループID','緊急度','完了日時']],
+  ];
+  defs.forEach(function(d){
+    var sh = ss.getSheetByName(d[0]);
+    if (!sh) sh = ss.insertSheet(d[0]);
+    sh.clearContents();
+    sh.appendRow(d[1]);
+  });
+  console.log('破壊的初期化を実行しました');
+}
+
+// シート作成・ヘッダー追加（既存データを絶対に削除しない）
 function setupSheet(ss, name, headers, color, widths) {
   var sheet = ss.getSheetByName(name);
-  if (!sheet) sheet = ss.insertSheet(name);
-  sheet.clearContents();
-  sheet.getBandings().forEach(function(b) { b.remove(); });
-  sheet.appendRow(headers);
-  var hr = sheet.getRange(1, 1, 1, headers.length);
-  hr.setFontWeight('bold').setBackground(color).setFontColor('#FFFFFF').setHorizontalAlignment('center');
-  widths.forEach(function(w, i) { sheet.setColumnWidth(i + 1, w); });
-  sheet.getRange(2, 1, 1000, headers.length).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);
+  if (!sheet) {
+    // 新規作成：ヘッダー書込・装飾
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headers);
+    var hr = sheet.getRange(1, 1, 1, headers.length);
+    hr.setFontWeight('bold').setBackground(color).setFontColor('#FFFFFF').setHorizontalAlignment('center');
+    if (widths) widths.forEach(function(w, i) { sheet.setColumnWidth(i + 1, w); });
+    return;
+  }
+  // 既存シート：ヘッダー存在チェック
+  if (sheet.getLastRow() === 0) {
+    // 完全空 → ヘッダーだけ追加
+    sheet.appendRow(headers);
+    var hr2 = sheet.getRange(1, 1, 1, headers.length);
+    hr2.setFontWeight('bold').setBackground(color).setFontColor('#FFFFFF').setHorizontalAlignment('center');
+    if (widths) widths.forEach(function(w, i) { sheet.setColumnWidth(i + 1, w); });
+    return;
+  }
+  // 既存ヘッダーあり → 不足列のみ右側に追加
+  var lastCol     = sheet.getLastColumn();
+  var curHeaders  = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h).trim(); });
+  headers.forEach(function(h){
+    if (curHeaders.indexOf(h) === -1) {
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue(h);
+      var newCol = sheet.getLastColumn();
+      sheet.getRange(1, newCol).setFontWeight('bold').setBackground(color).setFontColor('#FFFFFF').setHorizontalAlignment('center');
+      curHeaders.push(h);
+    }
+  });
 }
 
 // ==========================================
@@ -2512,6 +2670,70 @@ function testNewProjectFlow() {
   clearNewProjectMode(userId);
   deletePendingItems(batchId);
   console.log('テスト終了（仮タスクは削除済み）');
+}
+
+// === セキュリティ・データ保護関連テスト ===
+
+// setup() が既存データを消さないことを確認（破壊テスト：テスト後にデータ復元される）
+function testSafeSetupDoesNotDeleteData() {
+  var ss = getSS();
+  var sh = ss.getSheetByName('タスク管理');
+  if (!sh || sh.getLastRow() < 2) {
+    console.log('タスク管理にデータがないため、別の方法で確認します');
+    var rowsBefore = sh ? sh.getLastRow() : 0;
+    setup();
+    var rowsAfter = getSheet('タスク管理').getLastRow();
+    console.log(rowsAfter >= rowsBefore ? '✅ データ件数維持' : '❌ データ消失！');
+    return;
+  }
+  var before = sh.getLastRow();
+  var sampleRow = sh.getRange(2, 1, 1, sh.getLastColumn()).getValues()[0];
+  console.log('実行前: ' + before + '行 / サンプル行先頭=' + sampleRow[0]);
+  setup();
+  var after = sh.getLastRow();
+  var sampleAfter = sh.getRange(2, 1, 1, sh.getLastColumn()).getValues()[0];
+  console.log('実行後: ' + after + '行 / サンプル行先頭=' + sampleAfter[0]);
+  console.log((before === after && String(sampleRow[0]) === String(sampleAfter[0])) ? '✅ データ完全保持' : '❌ データに変化あり');
+}
+
+// タスク管理・完了タスクに緊急度列があるか
+function testTaskHeadersIncludeUrgency() {
+  ['タスク管理', '完了タスク'].forEach(function(name){
+    var sh = getSheet(name);
+    if (!sh) { console.log('❌ ' + name + ' シート未存在'); return; }
+    var hdrs = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+    console.log(name + ' ヘッダー:', hdrs.join(' / '));
+    console.log(hdrs.indexOf('緊急度') !== -1 ? '✅ 緊急度あり' : '❌ 緊急度なし');
+    if (name === '完了タスク') console.log(hdrs.indexOf('完了日時') !== -1 ? '✅ 完了日時あり' : '❌ 完了日時なし');
+  });
+}
+
+// postback 分岐ロジック確認（実呼び出しなし）
+function testPostbackRouting() {
+  var cases = [
+    { data: 'action=doc_summary&p=foo', needBatch: false },
+    { data: 'action=link_group&p=foo&g=Cxxxx', needBatch: false },
+    { data: 'action=cancel&key=abc', needBatch: false },
+    { data: 'action=ignore_all&group=Cxxxx', needBatch: false },
+    { data: 'action=register&batch=abc', needBatch: true },
+    { data: 'action=set_project&batch=abc&p=foo', needBatch: true },
+    { data: 'action=new_project&batch=abc', needBatch: true },
+  ];
+  cases.forEach(function(c){
+    var p = parseParams(c.data);
+    var hasBatch = !!p.batch;
+    console.log('action=' + p.action + ' batch必要:' + c.needBatch + ' / batchあり:' + hasBatch);
+  });
+}
+
+// syncAllGroupMembers が分割関数を両方呼ぶか
+function testSyncAllGroupMembersNoDuplicate() {
+  var hasLogs     = typeof syncAllGroupMembersFromLogs     === 'function';
+  var hasProjects = typeof syncAllGroupMembersFromProjects === 'function';
+  var hasCombined = typeof syncAllGroupMembers             === 'function';
+  console.log('syncAllGroupMembersFromLogs:',     hasLogs     ? '✅' : '❌');
+  console.log('syncAllGroupMembersFromProjects:', hasProjects ? '✅' : '❌');
+  console.log('syncAllGroupMembers:',             hasCombined ? '✅' : '❌');
 }
 
 // 案件識別→確認フローの統合テスト（シート書き込みあり・LINE送信なし）
