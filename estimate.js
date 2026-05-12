@@ -35,8 +35,13 @@ var TOTAL_COL_SUBTOTAL       = 9;
 var COVER_SUBTOTAL_ROW       = 43;
 var COVER_SUBTOTAL_VALUE_COL = 9;
 
-// 2ページ目以降（明細）  同じ列構成
-var DETAIL_START_ROW      = 45;
+// 2ページ目以降（明細）
+// テンプレ構造: 行44-52がページヘッダー、行53〜84が page2 明細領域
+// 行85-93が page3 ヘッダー、行94以降が page3 明細領域（要確認）
+var DETAIL_START_ROW      = 53;
+var DETAIL_PAGE2_END_ROW  = 84;
+var DETAIL_PAGE3_START_ROW = 92;
+var DETAIL_PAGE3_END_ROW  = 126;
 var DETAIL_COL_NO         = 1;
 var DETAIL_COL_NAME       = 2;
 var DETAIL_COL_QTY        = 6;
@@ -427,26 +432,46 @@ function writeEstimateCover(targetSheet, estimateData, setting) {
 }
 
 function writeEstimateDetails(targetSheet, estimateData, setting) {
-  var row = DETAIL_START_ROW;
+  // page2: 53-84, page3: 94-125 を書込領域として、ページヘッダー行はスキップ
+  var rowState = { row: DETAIL_START_ROW, pageEnd: DETAIL_PAGE2_END_ROW, nextStart: DETAIL_PAGE3_START_ROW, nextEnd: DETAIL_PAGE3_END_ROW, overflow: false };
+
+  function advance() {
+    rowState.row++;
+    if (rowState.row > rowState.pageEnd) {
+      if (rowState.nextStart) {
+        rowState.row     = rowState.nextStart;
+        rowState.pageEnd = rowState.nextEnd;
+        rowState.nextStart = null;
+      } else {
+        rowState.overflow = true;
+      }
+    }
+  }
+
   estimateData.properties.forEach(function(p, pIdx){
-    // 物件見出し：「1　物件名」形式（連番+全角空白+物件名）。番号列は使わず名称列のみ。
-    targetSheet.getRange(row, DETAIL_COL_NAME).setValue((pIdx + 1) + '　' + p.property);
-    targetSheet.getRange(row, DETAIL_COL_NAME).setFontWeight('bold');
-    row++;
+    if (rowState.overflow) return;
+    // 物件見出し
+    targetSheet.getRange(rowState.row, DETAIL_COL_NAME).setValue((pIdx + 1) + '　' + p.property);
+    targetSheet.getRange(rowState.row, DETAIL_COL_NAME).setFontWeight('bold');
+    advance();
     var seqInProperty = 0;
     p.detailItems.forEach(function(d){
+      if (rowState.overflow) return;
       seqInProperty++;
-      targetSheet.getRange(row, DETAIL_COL_NO).setValue(seqInProperty);
-      targetSheet.getRange(row, DETAIL_COL_NAME).setValue(d.name);
-      // 数量・単価は空文字列「''」だと0扱いされる場合があるため明示的にsetValue
-      targetSheet.getRange(row, DETAIL_COL_QTY).setValue(d.qty === '' ? '' : d.qty);
-      targetSheet.getRange(row, DETAIL_COL_UNIT).setValue(d.unit || '');
-      targetSheet.getRange(row, DETAIL_COL_UNITPRICE).setValue(d.unitPrice === '' ? '' : d.unitPrice);
-      targetSheet.getRange(row, DETAIL_COL_AMOUNT).setValue(d.amount || '');
-      row++;
+      targetSheet.getRange(rowState.row, DETAIL_COL_NO).setValue(seqInProperty);
+      targetSheet.getRange(rowState.row, DETAIL_COL_NAME).setValue(d.name);
+      targetSheet.getRange(rowState.row, DETAIL_COL_QTY).setValue(d.qty === '' ? '' : d.qty);
+      targetSheet.getRange(rowState.row, DETAIL_COL_UNIT).setValue(d.unit || '');
+      targetSheet.getRange(rowState.row, DETAIL_COL_UNITPRICE).setValue(d.unitPrice === '' ? '' : d.unitPrice);
+      targetSheet.getRange(rowState.row, DETAIL_COL_AMOUNT).setValue(d.amount || '');
+      advance();
     });
-    row++; // 物件間の空行
+    advance(); // 物件間の空行
   });
+
+  if (rowState.overflow) {
+    console.warn('明細件数が page2+page3 の領域を超えました。テンプレを拡張してください。');
+  }
 }
 
 // 合計反映：テンプレ行10（税込合計/消費税/合計＝小計）と 1ページ目下部の小計（行43）
@@ -611,6 +636,22 @@ function setupEstimateForToho() {
 
 // GASエディタ実行ボタン用：東邦家具のテンプレを診断
 function diagnoseEstimateTemplateForToho() { diagnoseEstimateTemplate('toho'); }
+
+// テンプレの指定行範囲を表示（2ページ目/3ページ目の構造確認用）
+function dumpEstimateTemplateRows(fromRow, toRow) {
+  var settings = getEstimateLinkSettings();
+  var s = null;
+  for (var i = 0; i < settings.length; i++) if (settings[i].settingId === 'toho') { s = settings[i]; break; }
+  if (!s) { console.error('toho 設定なし'); return; }
+  var ss = SpreadsheetApp.openById(s.estimateSsId);
+  var tpl = ss.getSheetByName(s.templateSheet);
+  fromRow = fromRow || 40;
+  toRow = Math.min(toRow || 133, tpl.getLastRow());
+  var d = tpl.getRange(fromRow, 1, toRow - fromRow + 1, tpl.getLastColumn()).getValues();
+  for (var i = 0; i < d.length; i++) console.log('行' + (fromRow + i) + ':', JSON.stringify(d[i]));
+}
+function dumpEstimateTemplatePage2() { dumpEstimateTemplateRows(40, 90); }
+function dumpEstimateTemplatePage3() { dumpEstimateTemplateRows(85, 133); }
 
 // 見積書スプシのシート一覧を表示（テンプレ名確認用）
 function listEstimateSheetsForToho() {
