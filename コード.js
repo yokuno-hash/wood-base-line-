@@ -98,7 +98,7 @@ function handleEvent(ev) {
 // ==========================================
 function handleDM(ev, userId, groupId, sender, text, ts) {
   if (registerMember(userId)) {
-    sendLineReply(ev.replyToken, 'WOODBASE秘書AIに登録しました！\nタスクが割り当てられると通知が届きます。\n\n「残タスクは？」「今週の予定は？」と送ると確認できます。');
+    sendLineReply(ev.replyToken, 'WOODBASE秘書AIにご登録いただきました。\nタスクが割り当てられた際にはお知らせいたします。\n\n「残タスクは？」「今週の予定は？」とお送りいただくとご確認いただけます。');
     return;
   }
   if (isCompletionReport(text)) { handleCompletion(text, sender, ev.replyToken); return; }
@@ -110,31 +110,21 @@ function handleDM(ev, userId, groupId, sender, text, ts) {
 // SECTION 3: グループメッセージ
 //
 // 設計原則：グループは静かに保つ
-//   - 通常メッセージ → サイレント処理 → 確認は送信者のDMへ
-//   - @Bot メンション → handleMentionCommand → グループに返信
+//   - 通常メッセージ → サイレント処理のみ（ログ保存・将来の参照用）
+//   - @WBG メンション → handleMentionCommand → 即登録＋グループ返信
 // ==========================================
 function handleGroup(ev, groupId, userId, sender, text, ts) {
   var mention      = ev.message.mention;
   var botMentioned = isBotMentioned(mention);
 
-  // Bot宛メンション → グループ返信あり
+  // @WBG メンション → コマンド処理（グループに返信あり）
   if (botMentioned) {
     handleMentionCommand(ev, groupId, userId, sender, text, ts);
     return;
   }
 
-  // 通常メッセージ → グループには返信しない（サイレント処理）
-  if (shouldSkipExtraction(text)) return;
-  if (!ruleBasedFilter(text)) return;
-
-  var extracted = extractWithGemini(text, groupId, ts, sender);
-  if (!extracted || (extracted.tasks.length + extracted.schedules.length === 0)) return;
-
-  var proj    = identifyProject(text, groupId, extracted.projectNameHint);
-  var batchId = storePending(extracted, proj.name, groupId, userId, text);
-
-  // 確認は送信者のDMへ（グループは無音）
-  sendConfirmToDM(userId, extracted, proj, batchId);
+  // 通常メッセージ → グループには何も返さない（サイレント）
+  // メッセージログへの保存はdoPost側で実施済み
 }
 
 // Bot宛メンション時のコマンド処理（グループへの返信あり）
@@ -154,40 +144,147 @@ function handleMentionCommand(ev, groupId, userId, sender, text, ts) {
     handleCompletion(text, sender, ev.replyToken);
     return;
   }
-  // ④ タスク・スケジュール照会
+  // ④ 仮タスク確認
+  if (text.includes('仮タスク')) {
+    handlePendingList(ev.replyToken, groupId);
+    return;
+  }
+  // ④-b タスク・スケジュール照会
   if (isQuery(text)) {
     sendLineReply(ev.replyToken, answerQuery(text));
     return;
   }
-  // ⑤ タスク・スケジュール抽出（メンション付きで明示的に登録依頼）
-  if (!shouldSkipExtraction(text) && ruleBasedFilter(text)) {
+  // ⑤ タスク・スケジュール登録（@WBG メンション付き）
+  // メンション時はルールフィルタを通さず、Geminiに必ず判断させる
+  if (!shouldSkipExtraction(text)) {
     var extracted = extractWithGemini(text, groupId, ts, sender);
     if (extracted && (extracted.tasks.length + extracted.schedules.length > 0)) {
-      var proj    = identifyProject(text, groupId, extracted.projectNameHint);
-      var batchId = storePending(extracted, proj.name, groupId, userId, text);
-      if (proj.confidence >= 70) {
-        sendConfirmUI(ev.replyToken, extracted, proj.name, batchId);
-      } else {
-        sendProjectSelectUI(ev.replyToken, extracted, batchId);
+      var proj = identifyProject(text, groupId, extracted.projectNameHint);
+
+      // 曖昧な予定（5W1H不足）は質問を返す
+      var question = buildAmbiguityQuestion(extracted);
+      if (question) {
+        var batchId = storePending(extracted, proj.name, groupId, userId, text);
+        setRetryMode(userId, batchId);
+        sendLineReply(ev.replyToken, question);
+        return;
+      }
+
+      // 明確なタスク・予定 → 即登録＋取消ボタン
+      var registered = commitDirectly(extracted, proj.name, groupId, userId);
+      if (registered.tasks.length || registered.schedules.length) {
+        var cancelKey = saveCancelInfo(registered);
+        sendQuickReply(ev.replyToken,
+          buildRegisteredMsg(registered) + '\n\n間違いがあれば取消できます。',
+          [{ type: 'action', action: { type: 'postback', label: '↩️ 取消', data: 'action=cancel&key=' + cancelKey } }]
+        );
       }
       return;
     }
   }
-  // ⑥ 何も該当しない
-  sendLineReply(ev.replyToken,
-    '以下のコマンドが使えます：\n' +
-    '・残タスクは？\n' +
-    '・今週の予定は？\n' +
-    '・○○案件まとめて（会話要約）\n' +
-    '・○○案件 Docs更新（サマリーをDocsへ）\n' +
-    '・完了しました（タスク完了）'
-  );
+  // ⑥ 何も該当しない → Geminiに会話履歴を渡して文脈に沿った返答を生成
+  sendLineReply(ev.replyToken, answerWithContext(text, groupId, sender));
 }
 
-// Bot自身へのメンションか判定（isSelf: true）
+// グループ会話履歴・タスク状況を踏まえて自由に応答する（コマンド非該当時のフォールバック）
+function answerWithContext(question, groupId, sender) {
+  var config = getConfig();
+  var today  = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy年MM月dd日');
+
+  // 直近のグループ会話履歴（最大30件）
+  var logSheet = getSheet('メッセージログ');
+  var historyText = '（会話履歴なし）';
+  if (logSheet && logSheet.getLastRow() > 1) {
+    var rows = logSheet.getDataRange().getValues().slice(1)
+      .filter(function(r) { return r[1] === groupId; })
+      .slice(-30);
+    if (rows.length) {
+      historyText = rows.map(function(r) {
+        return '[' + r[0] + '] ' + r[2] + '：' + r[3];
+      }).join('\n');
+    }
+  }
+
+  // このグループに紐付く案件名
+  var projectName = getProjectNameByGroupId(groupId) || '';
+  var taskList    = projectName ? buildProjectTaskListText(projectName) : '';
+  var schedList   = projectName ? buildProjectSchedListText(projectName) : '';
+
+  var prompt =
+    'あなたはWOODBASE・Fの専属秘書AIです。今日：' + today + '\n' +
+    '相手は「' + sender + '」さんで、グループ「' + (projectName || '案件未設定') + '」での発言です。\n' +
+    '\n【あなたの役割】\n' +
+    '・グループの会話の流れを踏まえて、自然で具体的な返答をすること。\n' +
+    '・必ず丁寧な敬語（です・ます調）を使うこと。フランクな口調や「〜だよ」「〜だね」などは絶対に使わない。\n' +
+    '・「コマンド一覧」のような形式的な定型文は出さないこと。\n' +
+    '・回答は3〜4文以内で簡潔に。\n' +
+    '・状況がわからない場合は、何を確認すべきか具体的に問い返すこと。\n' +
+    '\n【このグループの直近会話】\n' + historyText +
+    (taskList  ? '\n\n【案件「' + projectName + '」の未完了タスク】\n' + taskList  : '') +
+    (schedList ? '\n\n【案件「' + projectName + '」の直近の予定】\n' + schedList : '') +
+    '\n\n' + sender + 'さんからのメッセージ：\n' + question;
+
+  return callGemini(config.GEMINI_API_KEY, prompt, 0.4) ||
+    '申し訳ございません。うまくお答えできませんでした。';
+}
+
+// 案件単位のタスク一覧テキスト
+function buildProjectTaskListText(projectName) {
+  var sheet = getSheet('タスク管理');
+  if (!sheet || sheet.getLastRow() <= 1) return '';
+  return sheet.getDataRange().getValues().slice(1)
+    .filter(function(r) {
+      return r[1] === projectName && String(r[5] || '') !== 'done' && String(r[5] || '') !== '完了';
+    })
+    .map(function(r) {
+      var dl = r[4] ? Utilities.formatDate(new Date(r[4]), 'Asia/Tokyo', 'M/d') : '期日未定';
+      return '・[' + (r[3] || '担当未定') + '] ' + r[2] + '（' + dl + '）';
+    }).join('\n');
+}
+
+// 案件単位の直近スケジュール一覧テキスト
+function buildProjectSchedListText(projectName) {
+  var sheet = getSheet('スケジュール管理');
+  if (!sheet || sheet.getLastRow() <= 1) return '';
+  var todayYmd = fmtDate(new Date());
+  return sheet.getDataRange().getValues().slice(1)
+    .filter(function(r) {
+      var d = r[3] instanceof Date ? fmtDate(r[3]) : String(r[3]).slice(0, 10);
+      return r[1] === projectName && d >= todayYmd;
+    })
+    .slice(0, 10)
+    .map(function(r) {
+      var d = r[3] instanceof Date ? fmtDate(r[3]) : String(r[3]).slice(0, 10);
+      return '・' + d.slice(5).replace('-', '/') + ' ' + r[2] + (r[4] ? ' ' + r[4] + '〜' : '');
+    }).join('\n');
+}
+
+// Bot自身へのメンションか判定（isSelf + botUserId の二重チェック）
 function isBotMentioned(mention) {
-  return !!(mention && mention.mentionees &&
-    mention.mentionees.some(function(m) { return m.isSelf === true; }));
+  if (!mention || !mention.mentionees || !mention.mentionees.length) return false;
+  var botId = getCachedBotUserId();
+  return mention.mentionees.some(function(m) {
+    return m.isSelf === true || (botId && m.userId === botId);
+  });
+}
+
+// ボット自身のuserIdをキャッシュ取得
+function getCachedBotUserId() {
+  var props  = PropertiesService.getScriptProperties();
+  var cached = props.getProperty('BOT_USER_ID');
+  if (cached) return cached;
+  try {
+    var config = getConfig();
+    var res = UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
+      headers: { 'Authorization': 'Bearer ' + config.LINE_CHANNEL_ACCESS_TOKEN },
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 200) {
+      var info = JSON.parse(res.getContentText());
+      if (info.userId) { props.setProperty('BOT_USER_ID', info.userId); return info.userId; }
+    }
+  } catch(e) { console.error('getCachedBotUserId error:', e.message); }
+  return null;
 }
 
 // グループのisSummaryRequest（メンション必須チェックを削除・handleMentionCommandで保証済み）
@@ -496,7 +593,7 @@ function sendConfirmUI(replyToken, extracted, projectName, batchId) {
 function sendProjectSelectUI(replyToken, extracted, batchId) {
   if (!replyToken) return;
   var summary = buildItemSummary(extracted);
-  var text    = '【タスク/予定を検出しました】\n\n' + summary + '\n\nどの案件ですか？（タップで選択）';
+  var text    = '【タスク／予定を検出いたしました】\n\n' + summary + '\n\nどの案件に登録しますか？（タップでご選択ください）';
 
   var projects = getActiveProjects(11); // 最大11件（+未分類で12件）
   var items = projects.map(function(name) {
@@ -577,14 +674,14 @@ function sendQuickReplyPush(targetId, text, items) {
 function sendConfirmToDM(userId, extracted, proj, batchId) {
   if (!userId) return;
 
-  var lines = ['📝 タスク/予定を検出しました。'];
+  var lines = ['📝 タスク／予定を検出いたしました。'];
   lines.push(buildItemSummary(extracted));
 
   var items = [];
 
   if (proj.confidence >= 70) {
     // 案件が確定済み → 確認UIをDMで
-    lines.push('\n案件：' + proj.name + '\n\n登録しますか？');
+    lines.push('\n案件：' + proj.name + '\n\n登録してよろしいですか？');
     items = [
       { type: 'action', action: { type: 'postback', label: '✅ 登録', data: 'action=register&batch=' + batchId } },
       { type: 'action', action: { type: 'postback', label: '✏️ 修正', data: 'action=edit&batch=' + batchId } },
@@ -592,7 +689,7 @@ function sendConfirmToDM(userId, extracted, proj, batchId) {
     ];
   } else {
     // 案件不明 → 案件選択 → 登録
-    lines.push('\nどの案件ですか？（タップで選択）');
+    lines.push('\nどの案件に登録しますか？（タップでご選択ください）');
     var projects = getActiveProjects(11);
     projects.forEach(function(name) {
       var label = name.length > 20 ? name.slice(0, 19) + '…' : name;
@@ -613,7 +710,57 @@ function handlePostback(ev, userId, groupId) {
   var params  = parseParams(data);
   var action  = params.action;
   var batchId = params.batch;
-  if (!action || !batchId) return;
+  if (!action) return;
+
+  // 即登録後の取消
+  if (action === 'cancel') {
+    var cancelKey = params.key;
+    if (!cancelKey) { sendLineReply(ev.replyToken, '取消情報が見つかりませんでした。'); return; }
+    var raw = PropertiesService.getScriptProperties().getProperty(cancelKey);
+    if (!raw) { sendLineReply(ev.replyToken, '取消期限（10分）が過ぎています。'); return; }
+    var info = safeParseJson(raw);
+    if (Date.now() - info.ts > 10 * 60 * 1000) {
+      sendLineReply(ev.replyToken, '取消期限（10分）が過ぎています。');
+      return;
+    }
+    // タスク削除
+    var taskSheet = getSheet('タスク管理');
+    if (taskSheet && info.taskIds && info.taskIds.length) {
+      var td = taskSheet.getDataRange().getValues();
+      for (var ti = td.length - 1; ti >= 1; ti--) {
+        if (info.taskIds.indexOf(String(td[ti][0])) !== -1) taskSheet.deleteRow(ti + 1);
+      }
+    }
+    // スケジュール削除
+    var schSheet = getSheet('スケジュール管理');
+    if (schSheet && info.scheds && info.scheds.length) {
+      var sd = schSheet.getDataRange().getValues();
+      for (var si = sd.length - 1; si >= 1; si--) {
+        var key2 = (sd[si][2] || '') + '|' + (sd[si][3] instanceof Date ? fmtDate(sd[si][3]) : String(sd[si][3]).slice(0, 10));
+        if (info.scheds.indexOf(key2) !== -1) schSheet.deleteRow(si + 1);
+      }
+    }
+    PropertiesService.getScriptProperties().deleteProperty(cancelKey);
+    sendLineReply(ev.replyToken, '↩️ 登録を取り消しました。');
+    return;
+  }
+
+  // 仮タスク全削除（グループID単位）
+  if (action === 'ignore_all') {
+    var targetGroup = decodeURIComponent(params.group || '');
+    if (!targetGroup) { sendLineReply(ev.replyToken, '削除対象が見つかりませんでした。'); return; }
+    var sheet0 = getSheet('仮タスク');
+    if (sheet0 && sheet0.getLastRow() > 1) {
+      var d0 = sheet0.getDataRange().getValues();
+      for (var x = d0.length - 1; x >= 1; x--) {
+        if (d0[x][3] === targetGroup) sheet0.deleteRow(x + 1);
+      }
+    }
+    sendLineReply(ev.replyToken, '🗑 確認待ちの仮タスクを全て削除しました。');
+    return;
+  }
+
+  if (!batchId) return;
 
   if (action === 'register') {
     var items = getPendingItems(batchId);
@@ -624,7 +771,7 @@ function handlePostback(ev, userId, groupId) {
 
   } else if (action === 'ignore') {
     deletePendingItems(batchId);
-    sendLineReply(ev.replyToken, '❌ 無視しました。登録されていません。');
+    sendLineReply(ev.replyToken, '❌ キャンセルしました。登録はされていません。');
 
   } else if (action === 'edit') {
     var items2 = getPendingItems(batchId);
@@ -632,8 +779,8 @@ function handlePostback(ev, userId, groupId) {
     var rawMsg = items2[0][10] || '（元のメッセージ不明）';
     setRetryMode(userId, batchId);
     sendLineReply(ev.replyToken,
-      '✏️ 修正内容を送ってください。\n\n【元のメッセージ】\n' + rawMsg +
-      '\n\n修正して送ると再度確認します。（10分以内）');
+      '✏️ 修正内容をお送りください。\n\n【元のメッセージ】\n' + rawMsg +
+      '\n\n修正内容をお送りいただくと再度ご確認いたします。（10分以内）');
 
   } else if (action === 'set_project') {
     // 案件選択後 → 案件名を仮タスクに適用 → 確認画面へ
@@ -654,7 +801,7 @@ function handlePostback(ev, userId, groupId) {
     var linkGroup   = decodeURIComponent(params.g || '');
     if (!linkProject || !linkGroup) { sendLineReply(ev.replyToken, '案件の紐付けに失敗しました。'); return; }
     linkGroupToProject(linkGroup, linkProject);
-    sendLineReply(ev.replyToken, '✅ このグループを「' + linkProject + '」に紐付けました。\nメッセージ・ファイルが自動で振り分けられます。');
+    sendLineReply(ev.replyToken, '✅ このグループを「' + linkProject + '」に紐付けました。\nメッセージ・ファイルは自動で振り分けられます。');
   }
 }
 
@@ -667,6 +814,44 @@ function parseParams(data) {
 // ==========================================
 // SECTION 9: 仮タスク操作
 // ==========================================
+// 仮タスク一覧をグループに表示（batchId単位でボタンを出す）
+function handlePendingList(replyToken, groupId) {
+  var sheet = getSheet('仮タスク');
+  if (!sheet || sheet.getLastRow() <= 1) {
+    sendLineReply(replyToken, '✅ 現在、確認待ちのタスク・予定はございません。');
+    return;
+  }
+  var data = sheet.getDataRange().getValues().slice(1);
+  // このグループのbatchIdを収集（重複なし）
+  var seen = {};
+  var batches = [];
+  data.forEach(function(r) {
+    if (r[3] === groupId && !seen[r[0]]) {
+      seen[r[0]] = true;
+      batches.push({ batchId: r[0], project: r[5], content: r[6], type: r[2], createdAt: r[9] });
+    }
+  });
+
+  if (!batches.length) {
+    sendLineReply(replyToken, '✅ このグループの確認待ちタスク・予定はございません。');
+    return;
+  }
+
+  var lines = ['📋 確認待ち一覧（' + batches.length + '件）\nタップで確認・登録できます。'];
+  batches.forEach(function(b, i) {
+    var icon = b.type === 'schedule' ? '📅' : '📌';
+    lines.push('\n' + (i + 1) + '. ' + icon + ' ' + (b.project || '案件未定') + '：' + String(b.content).slice(0, 25));
+  });
+
+  var items = batches.slice(0, 13).map(function(b, i) {
+    var label = ((i + 1) + '. ' + String(b.content).slice(0, 15)).slice(0, 20);
+    return { type: 'action', action: { type: 'postback', label: label, data: 'action=register&batch=' + b.batchId } };
+  });
+  items.push({ type: 'action', action: { type: 'postback', label: '🗑 全て削除', data: 'action=ignore_all&group=' + groupId } });
+
+  sendQuickReply(replyToken, lines.join('\n'), items);
+}
+
 function getPendingItems(batchId) {
   var sheet = getSheet('仮タスク');
   if (!sheet || sheet.getLastRow() <= 1) return [];
@@ -680,6 +865,70 @@ function deletePendingItems(batchId) {
   for (var i = data.length - 1; i >= 1; i--) {
     if (data[i][0] === batchId) sheet.deleteRow(i + 1);
   }
+}
+
+// 予定の5W1H不足チェック → 不足項目を日本語で質問文にして返す（なければnull）
+function buildAmbiguityQuestion(extracted) {
+  if (!extracted.schedules || !extracted.schedules.length) return null;
+  var s = extracted.schedules[0];
+  var missing = [];
+  if (!s.date && !s.startTime) missing.push('いつ・何時から');
+  if (!s.location)             missing.push('どこで');
+  if (!s.attendees)            missing.push('誰と（参加者）');
+  if (!missing.length) return null;
+  return '📅 予定を検出しましたが、以下が不明です。\n「' + (s.title || '予定') + '」\n\n不明な項目：' +
+    missing.join('、') + '\n\nこのまま送っていただくか、補足をご返信ください。';
+}
+
+// 確認なしで直接登録（グループ自動登録用）
+function commitDirectly(extracted, projectName, groupId, userId) {
+  var registered = { tasks: [], schedules: [] };
+  extracted.tasks.forEach(function(t) {
+    if (isDuplicateTask(t.taskContent, t.assignee, groupId)) return;
+    var task = {
+      task_id:      generateId(),
+      project_name: projectName,
+      content:      t.taskContent || '',
+      assignee:     t.assignee    || '',
+      due_date:     t.deadline    || '',
+      status:       'confirmed',
+      created_at:   fmtDT(new Date()),
+      group_id:     groupId,
+      urgency:      t.urgency     || '',
+    };
+    writeTask(task);
+    notifyAssignee(task);
+    registered.tasks.push(task);
+  });
+  extracted.schedules.forEach(function(s) {
+    var schedule = {
+      project_name: projectName,
+      title:        s.title       || '',
+      date:         s.date        || '',
+      startTime:    s.startTime   || '',
+      endTime:      s.endTime     || '',
+      location:     s.location    || '',
+      attendees:    s.attendees   || '',
+      description:  s.description || '',
+      group_id:     groupId,
+      datetime:     new Date(),
+    };
+    writeSchedule(schedule);
+    addToCalendar(schedule);
+    registered.schedules.push(schedule);
+  });
+  return registered;
+}
+
+// 取消用に登録済みIDをScriptPropertiesへ保存（10分TTL）
+function saveCancelInfo(registered) {
+  var key     = 'CANCEL_' + generateId();
+  var taskIds = registered.tasks.map(function(t) { return t.task_id; });
+  var scheds  = registered.schedules.map(function(s) { return s.title + '|' + s.date; });
+  PropertiesService.getScriptProperties().setProperty(
+    key, JSON.stringify({ taskIds: taskIds, scheds: scheds, ts: Date.now() })
+  );
+  return key;
 }
 
 // 案件名を仮タスクシートの該当行に適用（F列）
@@ -761,7 +1010,7 @@ function commitPendingItems(items) {
 }
 
 function buildRegisteredMsg(registered) {
-  var lines = ['✅ 登録しました！'];
+  var lines = ['✅ 登録が完了しました。'];
   registered.tasks.forEach(function(t) {
     lines.push('\n' + (t.urgency === '高' ? '🚨 緊急タスク' : '📋 タスク') + '\n案件：' + (t.project_name || '未分類') +
       '\n担当：' + (t.assignee || '未定') +
@@ -779,10 +1028,11 @@ function buildRegisteredMsg(registered) {
 function notifyAssignee(task) {
   var uid = getMemberUserId(task.assignee);
   if (uid) sendLineMessage(uid,
-    (task.urgency === '高' ? '🚨【至急】あなたへのタスク\n' : '【あなたへのタスク】\n') +
+    (task.urgency === '高' ? '🚨【至急】タスクのご連絡\n' : '【タスクのご連絡】\n') +
     '案件：' + (task.project_name || '未分類') +
     '\n内容：' + task.content +
-    '\n期日：' + (task.due_date || '未定'));
+    '\n期日：' + (task.due_date || '未定') +
+    '\n\nご確認のほどよろしくお願いいたします。');
 }
 
 // ==========================================
@@ -810,12 +1060,12 @@ function clearRetryMode(userId) {
 function reprocessMessage(text, oldBatchId, groupId, userId, sender, ts, replyToken) {
   deletePendingItems(oldBatchId);
   if (shouldSkipExtraction(text) || !ruleBasedFilter(text)) {
-    sendLineReply(replyToken, 'タスク・スケジュールが検出できませんでした。もう一度入力してください。');
+    sendLineReply(replyToken, 'タスク・スケジュールを検出できませんでした。お手数ですが、もう一度ご入力いただけますでしょうか。');
     return;
   }
   var extracted = extractWithGemini(text, groupId, ts, sender);
   if (!extracted || (extracted.tasks.length + extracted.schedules.length === 0)) {
-    sendLineReply(replyToken, 'タスク・スケジュールが見つかりませんでした。');
+    sendLineReply(replyToken, 'タスク・スケジュールが見つかりませんでした。恐れ入りますが、内容を確認の上もう一度お試しください。');
     return;
   }
   var proj    = identifyProject(text, groupId, extracted.projectNameHint);
@@ -999,7 +1249,7 @@ function saveFileToDrive(messageId, fileName, groupId, timestamp) {
     folder.createFile(blob);
     console.log('ファイル保存:', projectName + '/' + safeName);
 
-    sendLineMessage(groupId, '【ファイル保存】\n案件：' + projectName + '\nファイル：' + safeName + '\nGoogleドライブに保存しました。');
+    sendLineMessage(groupId, '【ファイル保存完了】\n案件：' + projectName + '\nファイル：' + safeName + '\nGoogleドライブに保存いたしました。');
   } catch (err) { console.error('saveFileToDrive error:', err.message); }
 }
 
@@ -1044,7 +1294,7 @@ function promptAllGroupsToLinkProject() {
         data: 'action=link_group&p=' + encodeURIComponent(name) + '&g=' + encodeURIComponent(gid) } };
     });
 
-    sendQuickReplyPush(gid, 'このグループはどの案件ですか？選択してください。', items);
+    sendQuickReplyPush(gid, 'このグループはどの案件に該当しますか？タップでご選択ください。', items);
     sent++;
     Utilities.sleep(500);
   });
@@ -1214,12 +1464,12 @@ function handleBotJoinGroup(replyToken, groupId) {
 
   var existing = getProjectNameByGroupId(groupId);
   if (existing) {
-    sendLineReply(replyToken, '✅ このグループはすでに「' + existing + '」に紐付けられています。');
+    sendLineReply(replyToken, 'このグループはすでに「' + existing + '」に紐付けられています。');
     return;
   }
   var projects = getActiveProjects(11);
   if (!projects.length) {
-    sendLineReply(replyToken, 'WOODBASE秘書AIです！\nまずスプレッドシートの「プロジェクト管理」に案件を登録してください。');
+    sendLineReply(replyToken, 'WOODBASE秘書AIです。\nまずスプレッドシートの「プロジェクト管理」に案件をご登録ください。');
     return;
   }
   var items = projects.map(function(name) {
@@ -1227,7 +1477,7 @@ function handleBotJoinGroup(replyToken, groupId) {
     return { type: 'action', action: { type: 'postback', label: label,
       data: 'action=link_group&p=' + encodeURIComponent(name) + '&g=' + encodeURIComponent(groupId) } };
   });
-  sendQuickReply(replyToken, 'WOODBASE秘書AIです！\nこのグループはどの案件ですか？', items);
+  sendQuickReply(replyToken, 'WOODBASE秘書AIです。\nこのグループはどの案件に該当しますか？タップでご選択ください。', items);
 }
 
 // グループIDをプロジェクト管理シートに登録
@@ -1430,15 +1680,43 @@ function answerQuery(question) {
   return callGemini(config.GEMINI_API_KEY, prompt, 0.2) || 'うまく答えられませんでした。';
 }
 
+function getRecentLogsForUser(memberName, limit) {
+  var sheet = getSheet('メッセージログ');
+  if (!sheet || sheet.getLastRow() <= 1) return '';
+  var data = sheet.getDataRange().getValues().slice(1);
+  var name = memberName.replace('さん', '');
+  var matched = data.filter(function(r) {
+    return String(r[2] || '').includes(name) || String(r[3] || '').includes(name);
+  }).slice(-(limit || 6));
+  if (!matched.length) return '';
+  return matched.map(function(r) {
+    return '[' + r[0] + '] ' + r[2] + '：' + r[3];
+  }).join('\n');
+}
+
 function answerQueryForMember(question, memberName) {
-  var config = getConfig();
-  var today  = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy年MM月dd日');
-  var prompt = 'あなたは株式会社WOOD BASE Fの秘書AIです。相手は「' + memberName + '」さんです。\n今日：' + today +
-    '\n\n【会社情報】\n' + buildCompanyInfoText() +
+  var config   = getConfig();
+  var today    = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy年MM月dd日');
+  var recentLogs = getRecentLogsForUser(memberName, 6);
+  var logBlock = recentLogs
+    ? '\n\n【' + memberName + 'さんの最近の会話（記憶）】\n' + recentLogs
+    : '';
+
+  var prompt =
+    'あなたはWOODBASE・Fの専属メンターAIです。相手は「' + memberName + '」さんです。今日：' + today + '\n' +
+    '\n【あなたの役割と姿勢】\n' +
+    '・現場で働くメンバーの頼れる存在として、温かく丁寧に対応すること。\n' +
+    '・メンバーが抱えるプレッシャーや悩みをまず受け止め、共感を示してから情報を伝えること。\n' +
+    '・正解や指示をトップダウンで押しつけるのではなく、「いかがでしょうか？」などコーチング型の問いかけを自然に交えること。\n' +
+    '・過去の会話履歴がある場合は、以前の相談内容を覚えているかのように自然に触れること。\n' +
+    '・必ず丁寧な敬語（です・ます調）を使うこと。フランクな口調や「〜だよ」「〜だね」などの表現は絶対に使わないこと。\n' +
+    '・回答は簡潔に。箇条書きより自然な文章を優先すること。\n' +
+    logBlock +
     '\n\n【' + memberName + 'さんの未完了タスク】\n' + buildTaskListText(memberName) +
-    '\n\n【スケジュール】\n' + buildSchedListText() +
-    '\n\n質問：' + question;
-  return callGemini(config.GEMINI_API_KEY, prompt, 0.2) || 'うまく答えられませんでした。';
+    '\n\n【直近のスケジュール】\n' + buildSchedListText() +
+    '\n\n' + memberName + 'さんからのメッセージ：\n' + question;
+
+  return callGemini(config.GEMINI_API_KEY, prompt, 0.4) || 'うまくお答えできませんでした。恐れ入りますが、もう一度お試しください。';
 }
 
 // 会社情報シートをセットアップ（公式サイトから取得した実データで初期化）
@@ -1557,7 +1835,7 @@ function isCompletionReport(text) {
 
 function handleCompletion(text, memberName, replyToken) {
   var sheet = getSheet('タスク管理');
-  if (!sheet || sheet.getLastRow() <= 1) { sendLineReply(replyToken, 'タスクが見つかりませんでした。'); return; }
+  if (!sheet || sheet.getLastRow() <= 1) { sendLineReply(replyToken, '現在タスクは登録されていません。'); return; }
 
   var data     = sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues();
   var clean    = (memberName || '').replace('さん', '').trim();
@@ -1570,7 +1848,7 @@ function handleCompletion(text, memberName, replyToken) {
     myTasks.push({ row: i + 2, content: data[i][2], project: data[i][1] });
   }
 
-  if (!myTasks.length) { sendLineReply(replyToken, '未完了タスクが見つかりませんでした。'); return; }
+  if (!myTasks.length) { sendLineReply(replyToken, '現在、未完了のタスクはございません。'); return; }
 
   var target = myTasks[0];
   if (myTasks.length > 1) {
@@ -1582,7 +1860,7 @@ function handleCompletion(text, memberName, replyToken) {
   }
 
   sheet.getRange(target.row, 6).setValue('done');
-  sendLineReply(replyToken, '✅ 完了しました！\n案件：' + target.project + '\nタスク：' + target.content);
+  sendLineReply(replyToken, '✅ 完了を記録いたしました。お疲れ様でございます。\n案件：' + target.project + '\nタスク：' + target.content);
 }
 
 function shouldSkipExtraction(text) {
@@ -1668,11 +1946,11 @@ function checkDeadlines() {
     var msg  = null;
 
     if (diff === 1) {
-      msg = '【明日期日】\n' + assignee + 'さん、明日が期日のタスクがあります。\n案件：' + project + '\nタスク：' + content;
+      msg = '【明日が期日です】\n' + assignee + 'さん、明日が期日のタスクがございます。ご確認をお願いいたします。\n案件：' + project + '\nタスク：' + content;
     } else if (diff === 0) {
-      msg = '【本日期日】\n' + assignee + 'さん、本日が期日のタスクです。\n案件：' + project + '\nタスク：' + content;
+      msg = '【本日が期日です】\n' + assignee + 'さん、本日が期日のタスクがございます。ご確認をお願いいたします。\n案件：' + project + '\nタスク：' + content;
     } else if (diff < 0) {
-      msg = '【期日超過】\n' + assignee + 'さん、期日を' + Math.abs(diff) + '日超過しています。\n案件：' + project + '\nタスク：' + content + '\n期日：' + dlStr;
+      msg = '【期日を超過しています】\n' + assignee + 'さん、期日を' + Math.abs(diff) + '日超過しているタスクがございます。ご対応をお願いいたします。\n案件：' + project + '\nタスク：' + content + '\n期日：' + dlStr;
     }
 
     if (msg) {
@@ -1730,12 +2008,12 @@ function checkStaleTasks() {
     var flagKey = 'STALE_' + row[0];
     if (PropertiesService.getScriptProperties().getProperty(flagKey)) continue;
 
-    var msg = '【進捗確認】\n' + assignee + 'さん、このタスクの状況はいかがですか？\n案件：' + (project || '未分類') +
-      '\nタスク：' + content + '\n\n完了した場合は「' + content.slice(0, 15) + ' 完了」と送ってください。';
+    var msg = '【進捗ご確認のお願い】\n' + assignee + 'さん、下記タスクの状況をご確認いただけますでしょうか。\n案件：' + (project || '未分類') +
+      '\nタスク：' + content + '\n\n完了された場合は「' + content.slice(0, 15) + ' 完了」とご送信ください。';
 
     var uid = getMemberUserId(assignee);
     if (uid) sendLineMessage(uid, msg);
-    if (groupId) sendLineMessage(groupId, '【連絡確認】' + assignee + 'さんへ：「' + content.slice(0, 20) + '」の対応状況を確認中です。');
+    if (groupId) sendLineMessage(groupId, '【状況確認中】' + assignee + 'さんへ：「' + content.slice(0, 20) + '」の対応状況をご確認中です。');
 
     PropertiesService.getScriptProperties().setProperty(flagKey, '1');
   }
